@@ -277,9 +277,9 @@ class StockWidget(QWidget):
             cells = [
                 (item['code'],                    NC['dim']),
                 (item['name'],                    NC['text']),
-                (f"{item['price']:.2f}",          color),
+                (f"{item['price']:.3f}",          color),
                 (f"{sign}{chg_pct:.2f}%",         color),
-                (f"{sign}{chg:.2f}",              color),
+                (f"{sign}{chg:.3f}",              color),
                 (f"{item['volume']:.3f}" if item['volume'] > 0 else "--", NC['dim']),
             ]
             for col, (text, fg) in enumerate(cells):
@@ -295,7 +295,7 @@ class StockWidget(QWidget):
                 alerted_this_batch.append((item['name'], chg_pct, item['price']))
 
         if alerted_this_batch:
-            lines = [f"{'↑' if p>0 else '↓'} {name}  {'+' if p>0 else ''}{p:.2f}%  ({price:.2f})"
+            lines = [f"{'↑' if p>0 else '↓'} {name}  {'+' if p>0 else ''}{p:.2f}%  ({price:.3f})"
                      for name, p, price in alerted_this_batch]
             _notify("📊 行情提醒", '\n'.join(lines))
             self.lbl_alert_info.setText(f"最近提醒: {alerted_this_batch[-1][0]} {alerted_this_batch[-1][1]:+.2f}%")

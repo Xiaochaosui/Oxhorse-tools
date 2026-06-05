@@ -4,12 +4,35 @@
 
 ## 功能一览
 
-| Tab | 功能 |
-|-----|------|
+| 窗口 | 功能 |
+|------|------|
 | ⏰ CLOCK | 上下班时钟 · 工作倒计时 · 今日实时工资 · 发薪倒计时 |
-| 🔔 REMIND | 喝水定时提醒 · 午饭/晚饭倒计时 · 系统桌面通知 |
+| 🔔 REMIND | 喝水/起身定时提醒 · 午饭/晚饭倒计时 · 系统桌面通知 |
 | 📊 STOCK | A 股行情盯盘，伪装成终端/代码风格浮窗 |
 | ✓ TODO | 飞书多维表格（Bitable）双向同步任务清单 |
+| 📈 STATS | 健康统计：喝水/起身/吃饭完成率 · 连续打卡 · 7 日趋势 · 时段热力图（托盘菜单打开） |
+
+## 界面预览
+
+### ⏰ CLOCK · 工作时钟
+
+![CLOCK](assets/imgs/CLOCK.png)
+
+### 🔔 REMIND · 提醒
+
+![REMIND](assets/imgs/REMIND.png)
+
+### 📊 STOCK · 盯盘
+
+![STOCK](assets/imgs/STOCK.png)
+
+### ✓ TODO · 飞书
+
+![TODO](assets/imgs/TODO.png)
+
+### 📈 STATS · 健康统计
+
+![STATS](assets/imgs/STATS.png)
 
 ---
 

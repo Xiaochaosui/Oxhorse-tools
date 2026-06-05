@@ -236,6 +236,7 @@ class RemindersWidget(QWidget):
         self._move_count_date   = datetime.now().date()
         self._daily_score_shown = None   # 当日评分是否已弹出
         self._build_ui()
+        self._load_today_progress_from_db()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(1000)
@@ -287,6 +288,8 @@ class RemindersWidget(QWidget):
 
         self.lbl_water_tip = QLabel()
         self.lbl_water_tip.setStyleSheet(f"color:{NC['dim']};font-size:11px;")
+        self.lbl_water_reward = QLabel()
+        self.lbl_water_reward.setStyleSheet(f"color:{NC['green']};font-size:11px;")
 
         btn = QPushButton("✓  喝了！")
         btn.setStyleSheet(f"""
@@ -299,6 +302,7 @@ class RemindersWidget(QWidget):
         right.addLayout(title_row)
         right.addWidget(self.lbl_water_countdown)
         right.addWidget(self.lbl_water_tip)
+        right.addWidget(self.lbl_water_reward)
         right.addStretch()
         right.addWidget(btn)
         lay.addLayout(right, 1)
@@ -340,6 +344,8 @@ class RemindersWidget(QWidget):
 
         self.lbl_move_tip = QLabel()
         self.lbl_move_tip.setStyleSheet(f"color:{NC['dim']};font-size:11px;")
+        self.lbl_move_reward = QLabel()
+        self.lbl_move_reward.setStyleSheet(f"color:{NC['green']};font-size:11px;")
 
         btn = QPushButton("🦵  动了！")
         btn.setStyleSheet(f"""
@@ -352,6 +358,7 @@ class RemindersWidget(QWidget):
         right.addLayout(title_row)
         right.addWidget(self.lbl_move_countdown)
         right.addWidget(self.lbl_move_tip)
+        right.addWidget(self.lbl_move_reward)
         right.addStretch()
         right.addWidget(btn)
         lay.addLayout(right, 1)
@@ -396,7 +403,36 @@ class RemindersWidget(QWidget):
 
     # ── 重置 ──────────────────────────────────────────────────────────────────
 
-    def _reset_water(self):
+    def _load_today_progress_from_db(self):
+        """启动时/跨天时，从数据库回填今日喝水和起身次数，避免重启清零。"""
+        today = datetime.now().date()
+        summary = hdb.daily_summary(today.isoformat())
+        self._water_count_today = summary.get(hdb.TYPE_WATER, {}).get(hdb.ACT_COMPLETED, 0)
+        self._move_count_today = summary.get(hdb.TYPE_MOVE, {}).get(hdb.ACT_COMPLETED, 0)
+        self._water_count_date = today
+        self._move_count_date = today
+        self._refresh_reward_labels()
+
+    def _refresh_reward_labels(self):
+        """统一刷新提醒页上的次数、鼓励和情绪价值文案。"""
+        water_count = self._water_count_today
+        move_count = self._move_count_today
+
+        cup_emoji = "🎊" if water_count >= 8 else ("🎯" if water_count >= 6 else "💧")
+        move_emoji = "🏆" if move_count >= 8 else ("⚡" if move_count >= 5 else "🦵")
+        self.lbl_water_count.setText(f"今日 {water_count} 杯 {cup_emoji}")
+        self.lbl_move_count.setText(f"今日起身 {move_count} 次 {move_emoji}")
+
+        water_tip = re_engine.get_encouragement_for_count(hdb.TYPE_WATER, water_count)
+        move_tip = re_engine.get_encouragement_for_count(hdb.TYPE_MOVE, move_count)
+        water_streak = hdb.streak(hdb.TYPE_WATER, min_per_day=1)
+        move_streak = hdb.streak(hdb.TYPE_MOVE, min_per_day=1)
+
+        # 强情绪价值：在卡片中直接给到“夸夸 + 连续天数反馈”。
+        self.lbl_water_reward.setText(f"你超棒！{water_tip}  连续 {water_streak} 天在照顾自己 ✨")
+        self.lbl_move_reward.setText(f"太自律了！{move_tip}  连续 {move_streak} 天在变强 🔥")
+
+    def _reset_water(self, from_alert: bool = False):
         today = datetime.now().date()
         if self._water_count_date != today:
             self._water_count_today = 0
@@ -405,7 +441,8 @@ class RemindersWidget(QWidget):
         self._last_water = datetime.now()
         self._notified_water = False
         self._water_ripple.trigger_ripple()
-        hdb.log(hdb.TYPE_WATER, hdb.ACT_COMPLETED)
+        if not from_alert:
+            hdb.log(hdb.TYPE_WATER, hdb.ACT_COMPLETED)
 
         # ── 奖励 ──
         count = self._water_count_today
@@ -419,12 +456,9 @@ class RemindersWidget(QWidget):
             badge, atitle, abody = ach
             QTimer.singleShot(800, lambda: rp.show_streak(f"{badge} {atitle}", abody))
 
-        cup_emoji = "🎊" if count >= 8 else ("🎯" if count >= 6 else "💧")
-        self.lbl_water_count.setText(f"今日 {count} 杯 {cup_emoji}")
-        tip = re_engine.get_encouragement_for_count(hdb.TYPE_WATER, count)
-        self.lbl_water_tip.setText(tip)
+        self._refresh_reward_labels()
 
-    def _reset_move(self):
+    def _reset_move(self, from_alert: bool = False):
         today = datetime.now().date()
         if self._move_count_date != today:
             self._move_count_today = 0
@@ -432,7 +466,8 @@ class RemindersWidget(QWidget):
         self._move_count_today += 1
         self._last_move = datetime.now()
         self._notified_move = False
-        hdb.log(hdb.TYPE_MOVE, hdb.ACT_COMPLETED)
+        if not from_alert:
+            hdb.log(hdb.TYPE_MOVE, hdb.ACT_COMPLETED)
 
         # ── 奖励 ──
         count = self._move_count_today
@@ -445,16 +480,17 @@ class RemindersWidget(QWidget):
             badge, atitle, abody = ach
             QTimer.singleShot(800, lambda: rp.show_streak(f"{badge} {atitle}", abody))
 
-        move_emoji = "🏆" if count >= 8 else ("⚡" if count >= 5 else "🦵")
-        self.lbl_move_count.setText(f"今日起身 {count} 次 {move_emoji}")
-        tip = re_engine.get_encouragement_for_count(hdb.TYPE_MOVE, count)
-        self.lbl_move_tip.setText(tip)
+        self._refresh_reward_labels()
 
     # ── 主 tick ───────────────────────────────────────────────────────────────
 
     def _tick(self):
         now = datetime.now()
         reminders = cfg.load().get('reminders', {})
+
+        # 跨天时自动重载今日进度（从数据库读取），保证计数与统计一致。
+        if self._water_count_date != now.date() or self._move_count_date != now.date():
+            self._load_today_progress_from_db()
 
         # ── 喝水 ──
         water_interval = cfg.get('reminders.water_interval_minutes', 60)
@@ -472,7 +508,8 @@ class RemindersWidget(QWidget):
                 self._notified_water = True
                 hdb.log(hdb.TYPE_WATER, hdb.ACT_TRIGGERED)
                 self._water_alert = show_water_alert()
-                self._water_alert.dismissed.connect(self._reset_water)
+                self._water_alert.confirmed.connect(lambda: self._reset_water(from_alert=True))
+                self._water_alert.dismissed.connect(lambda: setattr(self, '_notified_water', False))
         else:
             m, s = divmod(int(water_rem), 60)
             urgent = water_rem < 300
@@ -501,7 +538,8 @@ class RemindersWidget(QWidget):
                 self._notified_move = True
                 hdb.log(hdb.TYPE_MOVE, hdb.ACT_TRIGGERED)
                 self._move_alert = show_move_alert()
-                self._move_alert.dismissed.connect(self._reset_move)
+                self._move_alert.confirmed.connect(lambda: self._reset_move(from_alert=True))
+                self._move_alert.dismissed.connect(lambda: setattr(self, '_notified_move', False))
         else:
             m, s = divmod(int(move_rem), 60)
             urgent = move_rem < 300

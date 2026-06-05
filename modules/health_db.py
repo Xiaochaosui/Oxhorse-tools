@@ -84,10 +84,52 @@ def query_range(start: str, end: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def query_all() -> list[dict]:
+    """查询全部记录（按时间排序）"""
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM events ORDER BY ts").fetchall()
+    return [dict(r) for r in rows]
+
+
+def _sanitize_events(rows: list[dict]) -> list[dict]:
+    """
+    过滤历史 bug 造成的伪 completed：
+    当同类型 auto_close 发生后 0~3 秒内出现 completed，判定为非真实打卡。
+    """
+    auto_close_times: dict[str, list[datetime]] = {}
+    out: list[dict] = []
+    for r in sorted(rows, key=lambda x: x.get('ts', '')):
+        t = r.get('type')
+        action = r.get('action')
+        ts = r.get('ts', '')
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            out.append(r)
+            continue
+
+        if action == ACT_AUTO_CLOSE:
+            auto_close_times.setdefault(t, []).append(dt)
+            out.append(r)
+            continue
+
+        if action == ACT_COMPLETED:
+            closes = auto_close_times.get(t, [])
+            is_false_completed = any(
+                0 <= (dt - ac).total_seconds() <= 3
+                for ac in closes[-6:]
+            )
+            if is_false_completed:
+                continue
+
+        out.append(r)
+    return out
+
+
 def daily_summary(day: str = None) -> dict:
     """今日各类型统计"""
     d = day or date.today().isoformat()
-    rows = query_day(d)
+    rows = _sanitize_events(query_day(d))
     result = {t: {a: 0 for a in [ACT_TRIGGERED, ACT_COMPLETED, ACT_SNOOZED, ACT_AUTO_CLOSE]}
               for t in [TYPE_WATER, TYPE_MOVE, TYPE_MEAL]}
     for r in rows:
@@ -108,11 +150,8 @@ def weekly_counts(event_type: str, action: str = ACT_COMPLETED) -> list[dict]:
     out = []
     for i in range(6, -1, -1):
         d = (today - timedelta(days=i)).isoformat()
-        with _conn() as c:
-            cnt = c.execute(
-                "SELECT COUNT(*) FROM events WHERE date=? AND type=? AND action=?",
-                (d, event_type, action)
-            ).fetchone()[0]
+        rows = _sanitize_events(query_day(d))
+        cnt = sum(1 for r in rows if r['type'] == event_type and r['action'] == action)
         out.append({'date': d, 'count': cnt, 'label': (today - timedelta(days=i)).strftime('%m/%d')})
     return out
 
@@ -121,16 +160,13 @@ def hourly_distribution(event_type: str, days: int = 30) -> list[int]:
     """过去 N 天各小时的触发/完成分布（0-23 时）"""
     start = (date.today() - timedelta(days=days)).isoformat()
     end   = date.today().isoformat()
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT hour, COUNT(*) as cnt FROM events "
-            "WHERE date>=? AND date<=? AND type=? AND action=? "
-            "GROUP BY hour ORDER BY hour",
-            (start, end, event_type, ACT_COMPLETED)
-        ).fetchall()
+    rows = _sanitize_events(query_range(start, end))
     dist = [0] * 24
     for r in rows:
-        dist[r['hour']] = r['cnt']
+        if r['type'] == event_type and r['action'] == ACT_COMPLETED:
+            hr = int(r['hour'])
+            if 0 <= hr <= 23:
+                dist[hr] += 1
     return dist
 
 
@@ -140,11 +176,11 @@ def streak(event_type: str, min_per_day: int = 1) -> int:
     days = 0
     for i in range(365):
         d = (today - timedelta(days=i)).isoformat()
-        with _conn() as c:
-            cnt = c.execute(
-                "SELECT COUNT(*) FROM events WHERE date=? AND type=? AND action=?",
-                (d, event_type, ACT_COMPLETED)
-            ).fetchone()[0]
+        rows = _sanitize_events(query_day(d))
+        cnt = sum(
+            1 for r in rows
+            if r['type'] == event_type and r['action'] == ACT_COMPLETED
+        )
         if cnt >= min_per_day:
             days += 1
         else:
@@ -154,12 +190,10 @@ def streak(event_type: str, min_per_day: int = 1) -> int:
 
 def all_time_totals() -> dict:
     """全量统计"""
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT type, action, COUNT(*) as cnt FROM events GROUP BY type, action"
-        ).fetchall()
+    rows = _sanitize_events(query_all())
     result = {}
     for r in rows:
-        t, a, cnt = r['type'], r['action'], r['cnt']
-        result.setdefault(t, {})[a] = cnt
+        t, a = r['type'], r['action']
+        result.setdefault(t, {}).setdefault(a, 0)
+        result[t][a] += 1
     return result

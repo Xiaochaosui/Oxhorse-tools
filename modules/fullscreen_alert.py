@@ -89,6 +89,9 @@ class Particle:
 
 class FullscreenAlert(QWidget):
     dismissed = pyqtSignal()
+    confirmed = pyqtSignal()
+    snoozed = pyqtSignal()
+    auto_closed = pyqtSignal()
 
     WATER_CFG = {
         'kind':      'water',
@@ -185,7 +188,7 @@ class FullscreenAlert(QWidget):
             QPushButton:hover {{ background: rgba(255,255,255,0.12); }}
             QPushButton:pressed {{ background: rgba(255,255,255,0.22); }}
         """)
-        btn.clicked.connect(self._dismiss)
+        btn.clicked.connect(self._confirm)
         self._btn = btn
 
         # 「再给我5分钟」按钮（仅运动提醒）
@@ -242,7 +245,16 @@ class FullscreenAlert(QWidget):
         if self._countdown <= 0:
             self._cd_timer.stop()
             self._log_action('auto_close')
+            self.auto_closed.emit()
             self._dismiss()
+
+    def _confirm(self):
+        """用户明确点击主按钮，才算真实完成。"""
+        self._cd_timer.stop()
+        self._log_action('completed')
+        self.confirmed.emit()
+        self._fade_out = True
+        self._burst(4)
 
     def _dismiss(self):
         self._cd_timer.stop()
@@ -253,6 +265,7 @@ class FullscreenAlert(QWidget):
         """再坐5分钟 — 关闭弹窗但不重置计时器"""
         self._cd_timer.stop()
         self._log_action('snoozed')
+        self.snoozed.emit()
         self._fade_out = True
         self._burst(2)
 
