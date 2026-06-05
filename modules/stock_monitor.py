@@ -15,6 +15,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QColor
 from modules.theme import NEON_COLORS as NC
 import modules.config_manager as cfg
+from modules.daily_report import ReportPanel
 
 SINA_URL = "http://hq.sinajs.cn/list={codes}"
 SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
@@ -246,6 +247,10 @@ class StockWidget(QWidget):
         mg.addWidget(btn_remove)
         mg.addWidget(btn_refresh)
         root.addWidget(manage_group)
+
+        # ── 收盘报告面板 ──
+        self._report_panel = ReportPanel()
+        root.addWidget(self._report_panel)
 
     def _save_alert_threshold(self, val: float):
         self._alert_threshold = val

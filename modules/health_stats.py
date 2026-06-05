@@ -405,13 +405,12 @@ class HealthStatsWindow(QWidget):
         btn_close = QPushButton("×")
         btn_close.setFixedSize(24, 24)
         btn_close.setStyleSheet(f"""
-            QPushButton {{background:transparent;color:{NC['dim']};border:none;font-size:16px;}}
-            QPushButton:hover {{color:#ff5f57;}}
+            QPushButton {{background:transparent;color:#ff5f57;border:none;font-size:18px;font-weight:bold;}}
+            QPushButton:hover {{color:#ff2020;background:rgba(255,60,60,0.15);border-radius:4px;}}
         """)
         btn_close.clicked.connect(self.hide)
         tb.addWidget(btn_refresh); tb.addWidget(btn_close)
         title_bar.mousePressEvent   = self._tb_press
-        title_bar.mouseMoveEvent    = self._tb_move
         title_bar.mouseReleaseEvent = lambda e: setattr(self, '_drag_pos', None)
         root.addWidget(title_bar)
 
@@ -492,9 +491,17 @@ class HealthStatsWindow(QWidget):
         c = self.findChild(QFrame, "hs_container")
         if c: c.setGeometry(0, 0, self.width(), self.height())
 
+    def closeEvent(self, e):
+        e.ignore()
+        self.hide()
+
     def _tb_press(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            win = self.windowHandle()
+            if win:
+                win.startSystemMove()
+            else:
+                self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def _tb_move(self, e):
         if self._drag_pos and e.buttons() == Qt.MouseButton.LeftButton:

@@ -236,10 +236,8 @@ class FloatWindow(QWidget):
         tb_layout.addWidget(btn_close)
 
         title_bar.mousePressEvent   = self._tb_press
-        title_bar.mouseMoveEvent    = self._tb_move
         title_bar.mouseReleaseEvent = lambda e: setattr(self, '_drag_pos', None)
         lbl_title.mousePressEvent   = self._tb_press
-        lbl_title.mouseMoveEvent    = self._tb_move
 
         content = self._cfg['widget']()
         self._content_widget = content
@@ -262,12 +260,17 @@ class FloatWindow(QWidget):
             )
             self._btn_pin.setToolTip("未置顶 — 点击置顶")
 
-    # ── 拖拽移动 ──
+    # ── 拖拽移动（startSystemMove 跨平台，X11/Wayland/macOS/Windows 均可）──
     def _tb_press(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            win = self.windowHandle()
+            if win:
+                win.startSystemMove()
+            else:
+                # 兜底：手动记录坐标
+                self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
-    def _tb_move(self, e):
+    def mouseMoveEvent_drag(self, e):
         if self._drag_pos and e.buttons() == Qt.MouseButton.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag_pos)
 
