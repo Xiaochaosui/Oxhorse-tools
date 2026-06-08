@@ -219,10 +219,10 @@ class _ImageZoomDialog(QDialog):
         super().resizeEvent(e); self._update_image()
 
     def mousePressEvent(self, e):
-        # 点击空白处关闭
+        # 点击图片或空白背景关闭，按钮区不触发
         if e.button() == Qt.MouseButton.LeftButton:
             child = self.childAt(e.position().toPoint())
-            if child is None or child is self:
+            if child is None or child is self._img_lbl:
                 self.close()
         super().mousePressEvent(e)
 
@@ -350,7 +350,7 @@ class _DetailPanel(QFrame):
             or (self._current or {}).get("app_name", "")
             or ""
         )
-        dlg = _ImageZoomDialog(self._current_pix, title, parent=self)
+        dlg = _ImageZoomDialog(self._current_pix, title, parent=self.window())
         dlg.exec()
 
 
