@@ -26,6 +26,9 @@ from modules.stock_monitor import StockWidget
 from modules.todo_feishu import TodoWidget
 from modules.settings_window import SettingsWindow
 from modules.health_stats import HealthStatsWindow
+from modules.lifelog import LifeLogWindow
+from modules.lifelog_monitor import WindowMonitor, ClipboardMonitor, get_active_window
+import modules.lifelog_db as lifelog_db
 
 
 # ── 窗口配置 ──────────────────────────────────────────────────────────────
@@ -335,9 +338,12 @@ class App:
         self._windows: dict[str, FloatWindow] = {}
         self._settings_win: SettingsWindow | None = None
         self._stats_win: HealthStatsWindow | None = None
+        self._lifelog_win: LifeLogWindow | None = None
+        self._lifelog_recording = True
         self._build_windows()
         self._setup_tray()
-        QApplication.instance().aboutToQuit.connect(self._save_all_positions)
+        self._start_lifelog_monitors()
+        QApplication.instance().aboutToQuit.connect(self._on_quit)
 
     def _build_windows(self):
         screen = QApplication.primaryScreen().geometry()
@@ -442,6 +448,12 @@ class App:
         act_stats = QAction("📊  健康统计", menu)
         act_stats.triggered.connect(self._open_stats)
         menu.addAction(act_stats)
+        act_lifelog = QAction("⏳  时间胶囊", menu)
+        act_lifelog.triggered.connect(self._open_lifelog)
+        menu.addAction(act_lifelog)
+        self._lifelog_rec_action = QAction("⏸  暂停记录", menu)
+        self._lifelog_rec_action.triggered.connect(self._toggle_lifelog_recording)
+        menu.addAction(self._lifelog_rec_action)
         menu.addSeparator()
 
         # 各窗口独立显示切换
@@ -499,6 +511,56 @@ class App:
         self._stats_win.show()
         self._stats_win.raise_()
         self._stats_win.activateWindow()
+
+    def _open_lifelog(self):
+        if self._lifelog_win is None:
+            self._lifelog_win = LifeLogWindow()
+            screen = QApplication.primaryScreen().geometry()
+            self._lifelog_win.move(
+                screen.center().x() - self._lifelog_win.width() // 2,
+                screen.center().y() - self._lifelog_win.height() // 2,
+            )
+        self._lifelog_win.show()
+        self._lifelog_win.raise_()
+        self._lifelog_win.activateWindow()
+
+    def _toggle_lifelog_recording(self):
+        self._lifelog_recording = not self._lifelog_recording
+        self._lifelog_rec_action.setText(
+            "⏸  暂停记录" if self._lifelog_recording else "▶  继续记录"
+        )
+        if self._lifelog_win:
+            self._lifelog_win.set_recording(self._lifelog_recording)
+
+    def _start_lifelog_monitors(self):
+        self._win_mon  = WindowMonitor()
+        self._win_mon.window_changed.connect(self._on_window_change)
+        self._win_mon.start()
+
+        self._clip_mon = ClipboardMonitor(QApplication.instance().clipboard())
+        self._clip_mon.new_clip.connect(self._on_clipboard)
+        self._clip_mon.start()
+
+    def _on_window_change(self, app: str, title: str, shot: str):
+        if self._lifelog_recording:
+            lifelog_db.insert("window", app_name=app,
+                              window_title=title, content_path=shot)
+
+    def _on_clipboard(self, clip_type: str, content: str):
+        if not self._lifelog_recording:
+            return
+        app, _ = get_active_window()
+        if clip_type == "text":
+            lifelog_db.insert("clipboard_text",  app_name=app, content_text=content)
+        else:
+            lifelog_db.insert("clipboard_image", app_name=app, content_path=content)
+
+    def _on_quit(self):
+        self._save_all_positions()
+        if hasattr(self, "_win_mon"):
+            self._win_mon.stop()
+        if hasattr(self, "_clip_mon"):
+            self._clip_mon.stop()
 
     def _set_all_pinned(self, pinned: bool):
         for win in self._windows.values():
