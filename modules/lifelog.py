@@ -11,12 +11,13 @@ from PyQt6.QtWidgets import (
     QScrollArea, QPushButton, QLineEdit, QTextEdit,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem,
     QGraphicsTextItem, QCalendarWidget, QSplitter,
-    QStackedWidget, QTabBar, QApplication,
+    QStackedWidget, QTabBar, QApplication, QDialog,
+    QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QDate, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QDate, QTimer, pyqtSignal, QSize
 from PyQt6.QtGui import (
     QColor, QBrush, QPen, QPainter, QFont,
-    QPixmap, QTextCharFormat,
+    QPixmap, QTextCharFormat, QKeySequence, QShortcut,
 )
 
 import modules.lifelog_db as db
@@ -99,6 +100,136 @@ def _search_input(placeholder: str = "") -> QLineEdit:
     return w
 
 
+# ── 图片放大弹窗 ──────────────────────────────────────────────────────────
+
+class _ImageZoomDialog(QDialog):
+    """全屏可缩放图片查看器，ESC / 点击关闭"""
+
+    def __init__(self, pixmap: QPixmap, title: str = "", parent=None):
+        super().__init__(parent)
+        self._orig = pixmap
+        self.setWindowTitle(title or "// IMAGE VIEWER")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("background:transparent;")
+
+        # 占满主屏 80%
+        screen = QApplication.primaryScreen().geometry()
+        w = int(screen.width()  * 0.82)
+        h = int(screen.height() * 0.82)
+        self.resize(w, h)
+        self.move(
+            screen.center().x() - w // 2,
+            screen.center().y() - h // 2,
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+
+        # 外层容器（深色卡片）
+        card = QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{
+                background:rgba(10,14,26,245);
+                border:1px solid {_C['border']};
+                border-radius:10px;
+            }}
+        """)
+        cl = QVBoxLayout(card); cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(0)
+
+        # 标题栏
+        hdr = QFrame()
+        hdr.setFixedHeight(32)
+        hdr.setStyleSheet(f"""
+            QFrame {{
+                background:#060d1c;
+                border-top-left-radius:10px; border-top-right-radius:10px;
+                border-bottom:1px solid {_C['border']};
+            }}
+        """)
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(12, 0, 12, 0); hl.setSpacing(8)
+        for color in ['#ff5f57', '#febc2e', '#28c840']:
+            dot = QFrame(); dot.setFixedSize(10, 10)
+            dot.setStyleSheet(f"QFrame {{ background:{color}; border-radius:5px; }}")
+            hl.addWidget(dot)
+        hl.addSpacing(8)
+        lbl = QLabel(title or "// IMAGE VIEWER")
+        lbl.setStyleSheet(f"color:{_C['dim']}; font-size:10px; letter-spacing:2px;")
+        hl.addWidget(lbl); hl.addStretch()
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:#ff5f57;
+                border:none; font-size:16px; }}
+            QPushButton:hover {{ background:rgba(255,95,87,0.15); border-radius:4px; }}
+        """)
+        close_btn.clicked.connect(self.close)
+        hl.addWidget(close_btn)
+        cl.addWidget(hdr)
+
+        # 图片区（居中显示，保持比例）
+        self._img_lbl = QLabel()
+        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_lbl.setStyleSheet(
+            f"background:{_C['bg_dark']}; border:none;"
+        )
+        self._img_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        cl.addWidget(self._img_lbl, stretch=1)
+
+        # 底部按钮栏
+        footer = QFrame()
+        footer.setFixedHeight(40)
+        footer.setStyleSheet(f"""
+            QFrame {{
+                background:#060d1c;
+                border-top:1px solid {_C['border']};
+                border-bottom-left-radius:10px; border-bottom-right-radius:10px;
+            }}
+        """)
+        fl = QHBoxLayout(footer); fl.setContentsMargins(12, 0, 12, 0); fl.setSpacing(8)
+        fl.addStretch()
+
+        hint = QLabel("ESC / 点击空白关闭")
+        hint.setStyleSheet(f"color:{_C['dim']}; font-size:10px;")
+        fl.addWidget(hint)
+
+        copy_img_btn = _dark_btn("COPY IMAGE", _C["orange"])
+        copy_img_btn.clicked.connect(self._copy_image)
+        fl.addWidget(copy_img_btn)
+        cl.addWidget(footer)
+
+        root.addWidget(card)
+
+        QShortcut(QKeySequence("Escape"), self, activated=self.close)
+        self._update_image()
+
+    def _update_image(self):
+        avail_w = self.width()  - 2
+        avail_h = self.height() - 32 - 40 - 2
+        if avail_w > 0 and avail_h > 0 and not self._orig.isNull():
+            self._img_lbl.setPixmap(
+                self._orig.scaled(avail_w, avail_h,
+                                  Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+            )
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e); self._update_image()
+
+    def mousePressEvent(self, e):
+        # 点击空白处关闭
+        if e.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(e.position().toPoint())
+            if child is None or child is self:
+                self.close()
+        super().mousePressEvent(e)
+
+    def _copy_image(self):
+        QApplication.clipboard().setPixmap(self._orig)
+
+
 # ── 详情面板 ──────────────────────────────────────────────────────────────
 
 class _DetailPanel(QFrame):
@@ -138,44 +269,89 @@ class _DetailPanel(QFrame):
         self._img_lbl.setStyleSheet(
             f"background:{_C['bg_mid']}; border-radius:4px; border:none;"
         )
+        self._img_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self._img_lbl.hide()
         lay.addWidget(self._img_lbl, stretch=1)
 
-        btn_row = QHBoxLayout()
-        self._copy_btn = _dark_btn("COPY TEXT")
-        self._copy_btn.clicked.connect(self._copy)
-        btn_row.addWidget(self._copy_btn); btn_row.addStretch()
+        btn_row = QHBoxLayout(); btn_row.setSpacing(6)
+        self._copy_text_btn = _dark_btn("COPY TEXT")
+        self._copy_text_btn.clicked.connect(self._copy_text)
+        btn_row.addWidget(self._copy_text_btn)
+
+        self._copy_img_btn = _dark_btn("COPY IMAGE", _C["orange"])
+        self._copy_img_btn.clicked.connect(self._copy_image)
+        self._copy_img_btn.hide()
+        btn_row.addWidget(self._copy_img_btn)
+
+        self._zoom_btn = _dark_btn("ZOOM  ⤢", _C["cyan"])
+        self._zoom_btn.clicked.connect(self._zoom_image)
+        self._zoom_btn.hide()
+        btn_row.addWidget(self._zoom_btn)
+
+        btn_row.addStretch()
         lay.addLayout(btn_row)
 
         self._current: dict | None = None
+        self._current_pix: QPixmap | None = None
 
     def show_event(self, data: dict):
         self._current = data
         t  = data.get("type", "")
         dt = datetime.fromtimestamp(data["ts"])
         self._title.setText(
-            data.get("window_title") or data.get("content_text", "")[:60] or data.get("app_name", "") or "(无内容)"
+            data.get("window_title") or data.get("content_text", "")[:60]
+            or data.get("app_name", "") or "(无内容)"
         )
         self._meta.setText(
-            f"{data.get('app_name','')}   //   {dt.strftime('%Y-%m-%d  %H:%M:%S')}   //   {TYPE_LABEL.get(t,t)}"
+            f"{data.get('app_name','')}   //   "
+            f"{dt.strftime('%Y-%m-%d  %H:%M:%S')}   //   {TYPE_LABEL.get(t,t)}"
         )
         img_path = data.get("content_path", "") if t in ("clipboard_image", "window") else ""
         if img_path:
-            self._text_box.hide(); self._copy_btn.hide(); self._img_lbl.show()
             pix = QPixmap(img_path)
-            if not pix.isNull():
+            self._current_pix = pix if not pix.isNull() else None
+            self._text_box.hide()
+            self._copy_text_btn.hide()
+            self._img_lbl.show()
+            self._copy_img_btn.setVisible(self._current_pix is not None)
+            self._zoom_btn.setVisible(self._current_pix is not None)
+            if self._current_pix:
                 self._img_lbl.setPixmap(
-                    pix.scaled(self._img_lbl.width() or 320, 300,
-                               Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
+                    self._current_pix.scaled(
+                        self._img_lbl.width() or 320, 300,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
                 )
+                self._img_lbl.mousePressEvent = lambda _e: self._zoom_image()
         else:
-            self._img_lbl.hide(); self._text_box.show(); self._copy_btn.show()
+            self._current_pix = None
+            self._img_lbl.hide()
+            self._copy_img_btn.hide()
+            self._zoom_btn.hide()
+            self._text_box.show()
+            self._copy_text_btn.show()
             self._text_box.setPlainText(data.get("content_text", "") or "")
 
-    def _copy(self):
+    def _copy_text(self):
         if self._current and self._current.get("content_text"):
             QApplication.clipboard().setText(self._current["content_text"])
+
+    def _copy_image(self):
+        if self._current_pix:
+            QApplication.clipboard().setPixmap(self._current_pix)
+
+    def _zoom_image(self):
+        if not self._current_pix:
+            return
+        t = (self._current or {}).get("type", "")
+        title = f"// {TYPE_LABEL.get(t,'IMAGE')}  ·  " + (
+            (self._current or {}).get("window_title")
+            or (self._current or {}).get("app_name", "")
+            or ""
+        )
+        dlg = _ImageZoomDialog(self._current_pix, title, parent=self)
+        dlg.exec()
 
 
 # ── 事件行 ─────────────────────────────────────────────────────────────────
