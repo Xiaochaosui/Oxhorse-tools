@@ -8,6 +8,10 @@ import os
 import json
 sys.path.insert(0, os.path.dirname(__file__))
 
+# 首次运行：为缺失的 config/*.json 生成默认文件
+from modules.config_manager import ensure_defaults
+ensure_defaults()
+
 WIN_POS_FILE = os.path.join(os.path.dirname(__file__), 'config', 'window_positions.json')
 AUTOSTART_PATH = os.path.expanduser('~/.config/autostart/work-assistant.desktop')
 SCRIPT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'main.py'))

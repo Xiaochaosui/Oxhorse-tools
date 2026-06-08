@@ -201,14 +201,19 @@ def _build_prompt(stocks_data: dict[str, list[dict]]) -> str:
 
 
 def _call_claude(prompt: str, on_progress=None) -> str:
-    """使用 streaming 调用 subrouter，避免长请求被网关 524 超时"""
+    """使用 streaming 调用 Claude API，避免长请求被网关 524 超时"""
+    import os
+    api_key = os.environ.get('ANTHROPIC_AUTH_TOKEN') or os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        return "⚠️ 未找到 Claude API Key，请设置环境变量 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY"
+    base_url = os.environ.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com').rstrip('/')
     if on_progress:
         on_progress("正在调用 Claude 分析（流式输出，约30-60秒）...")
     try:
         import json as _json
-        url = "https://subrouter.ai/v1/messages"
+        url = f"{base_url}/v1/messages"
         headers = {
-            "x-api-key": "sk-ULmq08rBsPLsVPmdjdf186MlUH1M4JLbzG0t9K6KckPbMN5W",
+            "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
@@ -372,6 +377,8 @@ class ReportTrigger(QObject):
         self._timer.start(30_000)
 
     def _check(self):
+        if not cfg.get('stock.report_enabled', True):
+            return
         now = datetime.now()
         if now.weekday() >= 5:
             return
@@ -409,8 +416,17 @@ class ReportPanel(QFrame):
         self.lbl = QLabel("📋 收盘报告  //  每日 15:05 自动生成")
         self.lbl.setStyleSheet(f"color:{NC['dim']};font-size:11px;border:none;")
 
+        # 开关按钮
+        self._enabled = cfg.get('stock.report_enabled', True)
+        self.btn_toggle = QPushButton()
+        self.btn_toggle.setFixedWidth(52)
+        self.btn_toggle.setStyleSheet(self._toggle_style())
+        self.btn_toggle.setText("ON" if self._enabled else "OFF")
+        self.btn_toggle.clicked.connect(self._toggle)
+
         self.btn_gen = QPushButton("立即生成")
         self.btn_gen.setFixedWidth(82)
+        self.btn_gen.setEnabled(self._enabled)
         self.btn_gen.setStyleSheet(f"""
             QPushButton{{background:#0a1a2a;color:{NC['cyan']};border:1px solid {NC['border']};
                          border-radius:4px;padding:5px;font-size:11px;}}
@@ -431,7 +447,29 @@ class ReportPanel(QFrame):
         self.btn_open.clicked.connect(self._open)
 
         lay.addWidget(self.lbl); lay.addStretch()
+        lay.addWidget(self.btn_toggle)
         lay.addWidget(self.btn_gen); lay.addWidget(self.btn_open)
+
+    def _toggle_style(self) -> str:
+        if self._enabled:
+            return (f"QPushButton{{background:#0a2a1a;color:{NC['green']};border:1px solid #1a4a2a;"
+                    f"border-radius:4px;padding:5px;font-size:11px;font-weight:bold;}}"
+                    f"QPushButton:hover{{background:#0f3a1f;border-color:{NC['green']};}}")
+        else:
+            return (f"QPushButton{{background:#1a0a0a;color:{NC['dim']};border:1px solid #2a1a1a;"
+                    f"border-radius:4px;padding:5px;font-size:11px;font-weight:bold;}}"
+                    f"QPushButton:hover{{background:#2a1010;border-color:#aa3333;}}")
+
+    def _toggle(self):
+        self._enabled = not self._enabled
+        cfg.set('stock.report_enabled', self._enabled)
+        self.btn_toggle.setText("ON" if self._enabled else "OFF")
+        self.btn_toggle.setStyleSheet(self._toggle_style())
+        self.btn_gen.setEnabled(self._enabled)
+        if self._enabled:
+            self._set_status("📋 收盘报告已开启  //  每日 15:05 自动生成", NC['dim'])
+        else:
+            self._set_status("📋 收盘报告已关闭", NC['dim'])
 
     def _check_existing(self):
         today = date.today().strftime('%Y%m%d')
