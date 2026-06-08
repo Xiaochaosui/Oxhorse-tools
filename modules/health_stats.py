@@ -348,7 +348,8 @@ class HealthStatsWindow(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
+            Qt.WindowType.Tool |
+            Qt.WindowType.WindowMinimizeButtonHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.resize(620, 680)
@@ -402,6 +403,13 @@ class HealthStatsWindow(QWidget):
             QPushButton:hover {{color:{NC['cyan']};}}
         """)
         btn_refresh.clicked.connect(self.refresh_all)
+        btn_min = QPushButton("–")
+        btn_min.setFixedSize(24, 24)
+        btn_min.setStyleSheet(f"""
+            QPushButton {{background:transparent;color:{NC['dim']};border:none;font-size:16px;font-weight:bold;}}
+            QPushButton:hover {{color:{NC['text']};background:rgba(255,255,255,0.08);border-radius:4px;}}
+        """)
+        btn_min.clicked.connect(self.showMinimized)
         btn_close = QPushButton("×")
         btn_close.setFixedSize(24, 24)
         btn_close.setStyleSheet(f"""
@@ -409,7 +417,7 @@ class HealthStatsWindow(QWidget):
             QPushButton:hover {{color:#ff2020;background:rgba(255,60,60,0.15);border-radius:4px;}}
         """)
         btn_close.clicked.connect(self.hide)
-        tb.addWidget(btn_refresh); tb.addWidget(btn_close)
+        tb.addWidget(btn_refresh); tb.addWidget(btn_min); tb.addWidget(btn_close)
         title_bar.mousePressEvent   = self._tb_press
         title_bar.mouseReleaseEvent = lambda e: setattr(self, '_drag_pos', None)
         root.addWidget(title_bar)
