@@ -25,8 +25,22 @@ _DEFAULTS = {
             "bitable_table_id": ""
         },
         "stock": {
-            "watchlist": [],
-            "watchlist_names": [],
+            "watchlist": ["sh000001",
+                        "sh000300",
+                        "sz399006",
+                        "sz002281",
+                        "sz000988",
+                        "sh516640",
+                        "sh588080"],
+            "watchlist_names": [
+                 "上证指数",
+                "沪深300",
+                "创业板指",
+                "sz002281",
+                "sz000988",
+                "sh516640",
+                "sh588080"
+            ],
             "refresh_interval_seconds": 10,
             "alert_threshold_pct": 3.0
         },
