@@ -29,15 +29,19 @@ def get_active_window() -> tuple[str, str]:
 
 def take_screenshot(app_name: str) -> str:
     """截全屏保存为 JPEG，返回文件路径，失败返回空串"""
-    from PIL import ImageGrab
     try:
-        img  = ImageGrab.grab()
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QScreen
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return ""
+        pixmap = screen.grabWindow(0)
         name = (
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
             f"{re.sub(r'[^a-zA-Z0-9]', '_', app_name)[:20]}.jpg"
         )
         path = SHOTS_DIR / name
-        img.save(str(path), "JPEG", quality=65)
+        pixmap.save(str(path), "JPEG", 65)
         return str(path)
     except Exception:
         return ""
