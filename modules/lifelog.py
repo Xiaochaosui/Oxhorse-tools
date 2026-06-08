@@ -110,7 +110,9 @@ class _ImageZoomDialog(QDialog):
         self._orig = pixmap
         self.setWindowTitle(title or "// IMAGE VIEWER")
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Dialog
+            | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setStyleSheet("background:transparent;")
@@ -350,7 +352,7 @@ class _DetailPanel(QFrame):
             or (self._current or {}).get("app_name", "")
             or ""
         )
-        dlg = _ImageZoomDialog(self._current_pix, title, parent=self.window())
+        dlg = _ImageZoomDialog(self._current_pix, title)
         dlg.exec()
 
 
