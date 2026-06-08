@@ -83,10 +83,53 @@ def _fetch_klines(code: str, days: int = 20) -> list[dict]:
                 except (ValueError, IndexError):
                     continue
             if result:
-                return result
+                return _supplement_today(code, result)
         except Exception:
             continue
     return []
+
+
+def _supplement_today(code: str, klines: list[dict]) -> list[dict]:
+    """若K线最新日期不是今天（收盘后API延迟），用新浪实时数据补齐当日条目"""
+    today_str = date.today().strftime('%Y-%m-%d')
+    if klines[-1]['date'] == today_str:
+        return klines
+    now = datetime.now()
+    # 周末或开盘前不补充
+    if now.weekday() >= 5 or now.hour < 9 or (now.hour == 9 and now.minute < 30):
+        return klines
+    try:
+        url = f"http://hq.sinajs.cn/list={code}"
+        r = requests.get(url, headers={"Referer": "https://finance.sina.com.cn"}, timeout=5)
+        r.encoding = 'gbk'
+        m = re.search(r'"([^"]*)"', r.text)
+        if not m:
+            return klines
+        parts = m.group(1).split(',')
+        if len(parts) < 9:
+            return klines
+        price  = float(parts[3]) if parts[3] else 0
+        open_p = float(parts[1]) if parts[1] else price
+        high_p = float(parts[4]) if parts[4] else price
+        low_p  = float(parts[5]) if parts[5] else price
+        vol    = float(parts[8]) * 100 if parts[8] else 0  # 手 → 股
+        if price <= 0:
+            return klines
+        prev_close = klines[-1]['close']
+        chg_pct = (price - prev_close) / prev_close * 100 if prev_close else 0
+        klines.append({
+            'date':    today_str,
+            'open':    open_p,
+            'close':   price,
+            'high':    high_p,
+            'low':     low_p,
+            'volume':  vol,
+            'chg_pct': chg_pct,
+            'name':    klines[-1]['name'],
+        })
+    except Exception:
+        pass
+    return klines
 
 
 def _get_name(code: str) -> str:
@@ -333,7 +376,7 @@ class ReportTrigger(QObject):
         if now.weekday() >= 5:
             return
         t = now.hour * 60 + now.minute
-        if t >= 15 * 60 + 5 and self._today_done != date.today():
+        if t >= 16 * 60 + 30 and self._today_done != date.today():
             self._today_done = date.today()
             self.trigger.emit()
 
