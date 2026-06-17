@@ -228,6 +228,75 @@ def _fetch_hot_sectors(top_n: int = 5) -> list[dict]:
         return []
 
 
+EM_DC_URL = "https://datacenter.eastmoney.com/securities/api/data/get"
+
+
+def _fetch_lhb_data(days_back: int = 2) -> dict:
+    """
+    获取最近 N 个交易日龙虎榜数据。
+    返回:
+        {
+          "date": "2026-06-16",
+          "top_buy":  [{"name","code","change_rate","net_amt","reason","d1","d5"}, ...],  # 净买入TOP10
+          "top_sell": [{"name","code","change_rate","net_amt","reason"}, ...],            # 净卖出TOP5
+          "watchlist_hit": [{"name","code","change_rate","net_amt","reason"}, ...]        # 自选股中上榜
+        }
+    """
+    since = (date.today() - timedelta(days=days_back + 2)).strftime('%Y-%m-%d')
+    watchlist_codes = set(cfg.get('stock.watchlist', []))
+    # 去掉 sh/sz 前缀，龙虎榜用纯数字代码
+    watch_nums = {c[2:] for c in watchlist_codes if len(c) > 2}
+
+    try:
+        r = requests.get(
+            EM_DC_URL,
+            params={
+                "type": "RPT_DAILYBILLBOARD_DETAILS",
+                "sty":  "ALL",
+                "p": 1, "ps": 100,
+                "st": "TRADE_DATE,BILLBOARD_NET_AMT",
+                "sr": "-1,-1",
+                "filter": f"(TRADE_DATE>'{since}')",
+            },
+            headers=EM_HEADERS, timeout=12,
+        )
+        rows = r.json().get("result", {}).get("data") or []
+    except Exception:
+        return {}
+
+    if not rows:
+        return {}
+
+    # 取最新交易日
+    latest_date = rows[0]["TRADE_DATE"][:10]
+    today_rows  = [x for x in rows if x["TRADE_DATE"][:10] == latest_date]
+
+    def _row_to_item(x: dict) -> dict:
+        return {
+            "name":        x.get("SECURITY_NAME_ABBR", ""),
+            "code":        x.get("SECURITY_CODE", ""),
+            "change_rate": x.get("CHANGE_RATE") or 0,
+            "net_amt":     (x.get("BILLBOARD_NET_AMT") or 0) / 1e8,   # 元→亿
+            "buy_amt":     (x.get("BILLBOARD_BUY_AMT")  or 0) / 1e8,
+            "sell_amt":    (x.get("BILLBOARD_SELL_AMT") or 0) / 1e8,
+            "reason":      x.get("EXPLANATION", ""),
+            "d1":          x.get("D1_CLOSE_ADJCHRATE") or 0,
+            "d5":          x.get("D5_CLOSE_ADJCHRATE") or 0,
+        }
+
+    sorted_rows = sorted(today_rows, key=lambda x: x.get("BILLBOARD_NET_AMT") or 0, reverse=True)
+    top_buy  = [_row_to_item(x) for x in sorted_rows[:10] if (x.get("BILLBOARD_NET_AMT") or 0) > 0]
+    top_sell = [_row_to_item(x) for x in reversed(sorted_rows[-5:]) if (x.get("BILLBOARD_NET_AMT") or 0) < 0]
+    watchlist_hit = [_row_to_item(x) for x in today_rows if x.get("SECURITY_CODE", "") in watch_nums]
+
+    return {
+        "date":          latest_date,
+        "top_buy":       top_buy,
+        "top_sell":      top_sell,
+        "watchlist_hit": watchlist_hit,
+    }
+
+
 def _fetch_all_stocks() -> tuple[dict[str, list[dict]], dict[str, dict]]:
     """并发获取所有自选股 K 线 + 资金流，返回 (klines_map, flow_map)"""
     codes = cfg.get('stock.watchlist', [])
@@ -262,34 +331,81 @@ def _fmt_yuan(v) -> str:
     return f"{sign}{v:.0f}"
 
 
-def _build_prompt(stocks_data: dict[str, list[dict]], flow_map: dict[str, dict] | None = None) -> str:
-    today = date.today().strftime('%Y-%m-%d')
+def _build_prompt(
+    stocks_data: dict[str, list[dict]],
+    flow_map:    dict[str, dict]  | None = None,
+    lhb_data:    dict             | None = None,
+) -> str:
+    today    = date.today().strftime('%Y-%m-%d')
     flow_map = flow_map or {}
+    lhb_data = lhb_data or {}
 
     # ── 板块资金热度 ──────────────────────────────────────────────────────────
-    hot_sectors = _fetch_hot_sectors(top_n=5)
-    sector_lines = []
-    for s in hot_sectors:
-        sector_lines.append(
-            f"  - {s['name']}：主力净流入 {_fmt_yuan(s['main_net'])}（占比 {s['main_net_pct']:+.2f}%）"
-        )
+    hot_sectors  = _fetch_hot_sectors(top_n=5)
+    sector_lines = [
+        f"  - {s['name']}：主力净流入 {_fmt_yuan(s['main_net'])}（占比 {s['main_net_pct']:+.2f}%）"
+        for s in hot_sectors
+    ]
 
     lines = [
-        f"你是一位专业的A股量化分析师。今天是 {today}，以下是我持仓/关注的A股与ETF标的数据，请给出精准、有操作价值的收盘分析报告。",
+        f"你是一位专业的A股量化分析师。今天是 {today}，以下是完整的市场数据，"
+        f"请给出精准、有操作价值的收盘分析报告，包含龙虎榜解读、行情预测和买入推荐。",
         "",
     ]
 
-    # ── 大盘板块背景 ──────────────────────────────────────────────────────────
+    # ── 1. 板块资金背景 ───────────────────────────────────────────────────────
     if sector_lines:
-        lines += [
-            "## 今日板块资金热度（主力净流入 TOP5）",
-            *sector_lines,
-            "",
-        ]
+        lines += ["## 一、今日板块资金热度（主力净流入 TOP5）", *sector_lines, ""]
 
-    # ── 各标的数据 ────────────────────────────────────────────────────────────
-    lines.append("## 各标的数据")
-    lines.append("K线格式：日期 | 开盘 | 收盘 | 最高 | 最低 | 成交量(万股) | 成交额 | 涨跌幅")
+    # ── 2. 龙虎榜数据 ─────────────────────────────────────────────────────────
+    if lhb_data:
+        lhb_date = lhb_data.get("date", today)
+        lines += [f"## 二、龙虎榜数据（{lhb_date}）", ""]
+
+        # 净买入榜
+        top_buy = lhb_data.get("top_buy", [])
+        if top_buy:
+            lines.append("### 主力净买入 TOP（机构/游资主动建仓信号）")
+            lines.append("股票 | 涨跌幅 | 净买入(亿) | 买入(亿) | 卖出(亿) | 上榜原因 | 次日涨跌 | 5日涨跌")
+            lines.append("-----|--------|-----------|--------|--------|---------|---------|--------")
+            for x in top_buy:
+                d1_str = f"{x['d1']:+.2f}%" if x['d1'] else "-"
+                d5_str = f"{x['d5']:+.2f}%" if x['d5'] else "-"
+                lines.append(
+                    f"{x['name']}({x['code']}) | {x['change_rate']:+.2f}% | "
+                    f"+{x['net_amt']:.2f} | {x['buy_amt']:.2f} | {x['sell_amt']:.2f} | "
+                    f"{x['reason'][:25]} | {d1_str} | {d5_str}"
+                )
+            lines.append("")
+
+        # 净卖出榜
+        top_sell = lhb_data.get("top_sell", [])
+        if top_sell:
+            lines.append("### 主力净卖出 TOP（主力出货/机构减仓信号）")
+            lines.append("股票 | 涨跌幅 | 净卖出(亿) | 上榜原因")
+            lines.append("-----|--------|-----------|--------")
+            for x in top_sell:
+                lines.append(
+                    f"{x['name']}({x['code']}) | {x['change_rate']:+.2f}% | "
+                    f"{x['net_amt']:.2f} | {x['reason'][:30]}"
+                )
+            lines.append("")
+
+        # 自选股命中
+        wl_hit = lhb_data.get("watchlist_hit", [])
+        if wl_hit:
+            lines.append("### 自选股中上榜个股（重点关注）")
+            for x in wl_hit:
+                lines.append(
+                    f"- **{x['name']}**（{x['code']}）涨跌 {x['change_rate']:+.2f}%  "
+                    f"净买入 {x['net_amt']:+.2f}亿  原因：{x['reason']}"
+                )
+            lines.append("")
+        else:
+            lines.append("*自选股今日无龙虎榜上榜记录*\n")
+
+    # ── 3. 持仓/自选股数据 ────────────────────────────────────────────────────
+    lines += ["## 三、持仓/自选股行情数据", "K线格式：日期 | 开盘 | 收盘 | 最高 | 最低 | 成交量(万股) | 成交额 | 涨跌幅"]
 
     for code, klines in stocks_data.items():
         if not klines:
@@ -297,30 +413,24 @@ def _build_prompt(stocks_data: dict[str, list[dict]], flow_map: dict[str, dict] 
             continue
         name = klines[-1].get('name', code)
         flow = flow_map.get(code, {})
-
         lines.append(f"\n### {name}（{code}）")
 
-        # 资金流摘要（今日）
         if flow:
-            amt      = _fmt_yuan(flow.get("amount"))
-            main_net = _fmt_yuan(flow.get("main_net"))
-            main_pct = f"{flow['main_net_pct']:+.2f}%" if flow.get("main_net_pct") is not None else "-"
+            amt       = _fmt_yuan(flow.get("amount"))
+            main_net  = _fmt_yuan(flow.get("main_net"))
+            main_pct  = f"{flow['main_net_pct']:+.2f}%" if flow.get("main_net_pct") is not None else "-"
             super_net = _fmt_yuan(flow.get("super_net"))
             big_net   = _fmt_yuan(flow.get("big_net"))
             mid_net   = _fmt_yuan(flow.get("mid_net"))
             small_net = _fmt_yuan(flow.get("small_net"))
             lines.append(
-                f"**今日资金流**：成交额={amt} | "
-                f"主力净={main_net}({main_pct}) | "
-                f"超大单净={super_net} | 大单净={big_net} | "
-                f"中单净={mid_net} | 小单净={small_net}"
+                f"**今日资金流**：成交额={amt} | 主力净={main_net}({main_pct}) | "
+                f"超大单净={super_net} | 大单净={big_net} | 中单净={mid_net} | 小单净={small_net}"
             )
 
-        # 近20日K线
         lines.append("近20日K线：")
         for k in klines:
-            vol_wan = k['volume'] / 100 if k['volume'] > 1e6 else k['volume'] / 100
-            # 成交额：若K线有额则用，否则用量×收盘价估算
+            vol_wan = k['volume'] / 100
             amt_str = _fmt_yuan(k.get('amount') or k['volume'] * k['close'])
             lines.append(
                 f"{k['date']} | {k['open']:.2f} | {k['close']:.2f} | "
@@ -328,31 +438,51 @@ def _build_prompt(stocks_data: dict[str, list[dict]], flow_map: dict[str, dict] 
                 f"{vol_wan:.0f}万股 | {amt_str} | {k['chg_pct']:+.2f}%"
             )
 
-    # ── 分析要求 ──────────────────────────────────────────────────────────────
+    # ── 4. 分析要求 ───────────────────────────────────────────────────────────
     lines += [
         "",
-        "## 分析要求",
-        "请用中文，对每个有数据的标的**逐一分析**（数据失败的跳过）：",
+        "## 四、分析要求",
         "",
-        "1. **今日量价与资金**",
-        "   - 涨跌幅 + 成交量较前日变化（放量/缩量/天量）",
-        "   - 主力净流入方向与力度（流入/流出多少亿）",
-        "   - 超大单与大单的分歧：是否与主力方向一致",
-        "   - 量价是否背离（如涨价缩量、跌价放量等异常信号）",
+        "### A. 自选股逐一分析（数据失败的跳过）",
         "",
-        "2. **近期趋势与位置**",
-        "   - 5/10/20日均线的方向与多空排列",
-        "   - 当前收盘价所处的支撑位 / 压力位",
-        "   - 是否处于关键位（突破/回踩/区间震荡）",
+        "对每只有数据的标的输出：",
+        "1. **今日量价与资金** — 涨跌幅、放量/缩量、主力净流入方向与力度、超大单与大单是否一致、有无量价背离",
+        "2. **近期趋势** — 5/10/20日均线方向与多空排列、当前关键支撑/压力位、是否处于突破/回踩/震荡位",
+        "3. **操作建议** — 明确给出：买入/持有/减仓/观望/止损，附简短理由（≤3句）+ 主要下行风险",
         "",
-        "3. **操作建议**（给出明确结论，不要含糊）",
-        "   - 建议：买入 / 持有 / 减仓 / 观望 / 止损",
-        "   - 理由：结合量价 + 资金流综合判断，不超过3句",
-        "   - 风险提示：最主要的一个下行风险",
+        "### B. 龙虎榜深度解读",
         "",
-        "最后统一输出：",
-        "- **整体市场研判**：结合板块资金热度与个股表现，判断今日市场风格（成长/价值/防御/题材）",
-        "- **明日重点关注**（3-5条）：哪些标的在什么条件下可介入/加仓/止损",
+        "基于上方龙虎榜数据：",
+        "1. **净买入榜解读** — 哪几只是机构主动建仓信号？哪几只是游资炒作？结合上榜原因和次日/5日表现判断成功率",
+        "2. **净卖出榜解读** — 是主力出货还是对倒？散户应回避哪些？",
+        "3. **龙虎榜规律总结** — 今日龙虎榜整体透露什么市场信号（资金偏好哪类标的/板块）",
+        "",
+        "### C. 明日行情预测",
+        "",
+        "综合板块资金热度 + 自选股表现 + 龙虎榜信号，预测：",
+        "1. **大盘方向** — 明日上证/创业板大概率走势（涨/跌/震荡），给出概率判断（如：上涨60%/震荡30%/下跌10%）",
+        "2. **热点板块** — 明日最可能持续活跃的1-2个板块，说明逻辑",
+        "3. **风险提示** — 明日最主要的1个下行风险（政策/外盘/技术面）",
+        "",
+        "### D. 最值得买入推荐（最重要）",
+        "",
+        "从以下维度综合评分，给出 **TOP 3 买入推荐**：",
+        "- 维度1：资金流持续流入（主力+超大单同向）",
+        "- 维度2：技术形态良好（均线多头/突破/回踩支撑）",
+        "- 维度3：龙虎榜机构净买入（若有）",
+        "- 维度4：板块景气（所在板块今日资金净流入为正）",
+        "- 维度5：性价比（涨幅不过大、仍有上行空间）",
+        "",
+        "每条推荐格式：",
+        "**【买入推荐 #N】股票名（代码）**",
+        "- 综合评分：X/5",
+        "- 买入理由：（2-3句，引用具体数据）",
+        "- 建议买入区间：X.XX ~ X.XX 元",
+        "- 目标价：X.XX 元（预期涨幅 X%）",
+        "- 止损位：X.XX 元",
+        "- 持有周期：短线（1-3日）/ 中线（1-2周）/ 波段（1个月以上）",
+        "",
+        "⚠️ 注意：推荐必须基于数据，不能无中生有；若数据不足以支撑推荐，直接说明原因。",
         "",
         "输出用 Markdown 格式，语气专业直接，量化具体数字，不要泛泛而谈。",
     ]
@@ -402,6 +532,38 @@ def _call_claude(prompt: str, on_progress=None) -> str:
         return text if text else "⚠️ Claude 返回内容为空"
     except Exception as e:
         return f"⚠️ Claude API 调用失败：{e}"
+
+
+# ── 结论词提取 ───────────────────────────────────────────────────────────────
+
+def _extract_conclusion(analysis: str) -> str:
+    """
+    从 AI 分析文本中提取一个结论词（2-3字），用于文件名。
+    扫描"整体市场研判"附近段落，按优先级匹配关键词。
+    匹配不到则返回"分析"。
+    """
+    # 优先从整体研判段落附近取，取不到就全文搜
+    anchor = re.search(r'整体市场研判.*', analysis)
+    scope = analysis[anchor.start():anchor.start() + 300] if anchor else analysis
+
+    candidates = [
+        # 强势偏多
+        ("强势", ["强势", "强烈看多", "大涨"]),
+        ("看多", ["看多", "偏多", "做多", "多头"]),
+        ("上攻", ["上攻", "突破", "上行"]),
+        # 弱势偏空
+        ("弱势", ["弱势", "强烈看空", "大跌"]),
+        ("看空", ["看空", "偏空", "做空", "空头"]),
+        ("下行", ["下行", "回落", "下跌"]),
+        # 中性
+        ("震荡", ["震荡", "盘整", "横盘", "区间"]),
+        ("谨慎", ["谨慎", "观望", "等待信号"]),
+        ("分化", ["分化", "结构性"]),
+    ]
+    for label, keywords in candidates:
+        if any(kw in scope for kw in keywords):
+            return label
+    return "分析"
 
 
 # ── HTML 报告渲染 ─────────────────────────────────────────────────────────────
@@ -504,23 +666,36 @@ def generate_report(on_progress=None, on_done=None):
     """后台线程生成报告；on_progress(msg:str)，on_done(path:str, err:str|None)"""
     def _run():
         try:
-            if on_progress: on_progress("正在获取行情数据与资金流...")
+            if on_progress: on_progress("正在获取行情数据、资金流与龙虎榜...")
+
+            # 并发拉取：K线/资金流 + 龙虎榜
+            lhb_result: dict = {}
+            def _lhb_worker():
+                nonlocal lhb_result
+                lhb_result = _fetch_lhb_data(days_back=2)
+
+            lhb_thread = threading.Thread(target=_lhb_worker, daemon=True)
+            lhb_thread.start()
             klines_map, flow_map = _fetch_all_stocks()
+            lhb_thread.join(timeout=15)
 
             success = sum(1 for v in klines_map.values() if v)
             flow_ok = sum(1 for v in flow_map.values() if v)
+            lhb_ok  = len(lhb_result.get("top_buy", [])) + len(lhb_result.get("top_sell", []))
             if on_progress: on_progress(
-                f"获取完成（K线 {success}/{len(klines_map)} 只，资金流 {flow_ok}/{len(flow_map)} 只），正在分析..."
+                f"获取完成（K线 {success}/{len(klines_map)} 只，资金流 {flow_ok} 只，"
+                f"龙虎榜 {lhb_ok} 条），正在分析..."
             )
 
-            prompt   = _build_prompt(klines_map, flow_map)
-            analysis = _call_claude(prompt, on_progress)
+            prompt      = _build_prompt(klines_map, flow_map, lhb_result)
+            analysis    = _call_claude(prompt, on_progress)
             stocks_data = klines_map
 
             if on_progress: on_progress("正在生成 HTML...")
-            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            html    = _build_html(analysis, stocks_data, now_str)
-            fname   = REPORTS_DIR / f"report_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
+            now_str    = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            html       = _build_html(analysis, stocks_data, now_str)
+            conclusion = _extract_conclusion(analysis)
+            fname      = REPORTS_DIR / f"report_{datetime.now().strftime('%Y%m%d_%H%M')}_{conclusion}.html"
             fname.write_text(html, encoding='utf-8')
 
             if on_done: on_done(str(fname))

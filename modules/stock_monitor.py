@@ -9,10 +9,10 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QTableWidget, QTableWidgetItem, QPushButton, QLineEdit,
-    QHeaderView, QGroupBox, QDoubleSpinBox
+    QHeaderView, QGroupBox, QDoubleSpinBox, QMenu
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
+from PyQt6.QtGui import QColor, QAction
 from modules.theme import NEON_COLORS as NC
 import modules.config_manager as cfg
 from modules.daily_report import ReportPanel
@@ -87,13 +87,41 @@ class StockFetcher(QObject):
             self.data_ready.emit([])
 
 
+def _classify_code(code: str) -> str:
+    """将代码归类为 index / etf / stock"""
+    c = code.lower()
+    num = c[2:] if c[:2] in ('sh', 'sz', 'bj') else c
+    # 指数：sh000xxx / sz399xxx / sz0xxxxx(宽基)
+    if c.startswith('sh0') or c.startswith('sz3') or c.startswith('sh000'):
+        return 'index'
+    # ETF / 基金：sh5xxxxx / sz1xxxxx / sz159xxx
+    if (c.startswith('sh5') or c.startswith('sh6') and len(num) == 6 and num.startswith('5')
+            or c.startswith('sz1') or c.startswith('sz159')):
+        return 'etf'
+    if c.startswith('sh5') or c.startswith('sz1'):
+        return 'etf'
+    return 'stock'
+
+
+# 分组 tab 定义：id → 显示名
+_TABS = [
+    ('all',    'ALL'),
+    ('index',  '指数'),
+    ('stock',  '个股'),
+    ('etf',    'ETF'),
+    ('custom', '自选'),
+]
+
+
 class StockWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._fetcher = StockFetcher()
         self._fetcher.data_ready.connect(self._on_data)
         self._alert_threshold = cfg.get('stock.alert_threshold_pct', 3.0)
-        self._alerted: set = set()   # 已触发提醒的 code，避免重复弹
+        self._alerted: set = set()
+        self._last_data: list = []       # 缓存最新一批行情数据
+        self._active_tab: str = 'all'    # 当前激活的分组
         self._build_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -135,6 +163,26 @@ class StockWidget(QWidget):
         h_layout.addWidget(self.lbl_market_status, 1)
         root.addWidget(header)
 
+        # ── 分组 Tab 栏 ──
+        tab_bar = QFrame()
+        tab_bar.setStyleSheet(f"QFrame{{background:#050d18;border:1px solid {NC['border']};border-radius:6px;}}")
+        tab_layout = QHBoxLayout(tab_bar)
+        tab_layout.setContentsMargins(6, 4, 6, 4)
+        tab_layout.setSpacing(4)
+
+        self._tab_btns: dict[str, QPushButton] = {}
+        for tid, tlabel in _TABS:
+            btn = QPushButton(tlabel)
+            btn.setCheckable(True)
+            btn.setFixedHeight(22)
+            btn.clicked.connect(lambda _, t=tid: self._switch_tab(t))
+            self._tab_btns[tid] = btn
+            tab_layout.addWidget(btn)
+        tab_layout.addStretch()
+        self._tab_btns['all'].setChecked(True)
+        self._update_tab_style()
+        root.addWidget(tab_bar)
+
         # ── 行情表格 ──
         self.table = QTableWidget()
         self.table.setColumnCount(6)
@@ -163,6 +211,8 @@ class StockWidget(QWidget):
                 padding:5px 6px; font-size:10px; letter-spacing:1px;
             }}
         """)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
         root.addWidget(self.table)
 
         # ── 涨跌提醒设置 ──
@@ -268,17 +318,56 @@ class StockWidget(QWidget):
         if codes:
             self._fetcher.fetch(codes)
 
-    def _on_data(self, data: list):
-        self.lbl_last_update.setText(datetime.now().strftime('%H:%M:%S'))
-        self.table.setRowCount(len(data))
+    def _switch_tab(self, tab_id: str):
+        self._active_tab = tab_id
+        for tid, btn in self._tab_btns.items():
+            btn.setChecked(tid == tab_id)
+        self._update_tab_style()
+        self._render_table(self._last_data)
 
-        alerted_this_batch = []
-        for ri, item in enumerate(data):
+    def _update_tab_style(self):
+        for tid, btn in self._tab_btns.items():
+            active = btn.isChecked()
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background:{'#0f2a3a' if active else '#050d18'};
+                    color:{NC['cyan'] if active else NC['dim']};
+                    border:1px solid {NC['cyan'] if active else NC['border']};
+                    border-radius:4px; font-size:10px; padding:2px 8px;
+                    font-family:monospace; letter-spacing:1px;
+                }}
+                QPushButton:hover {{ background:#0f2a3a; border-color:{NC['cyan']}; color:{NC['cyan']}; }}
+            """)
+
+    def _update_tab_counts(self, data: list):
+        """更新各 tab 按钮上的数量标注"""
+        custom = set(cfg.get('stock.custom_group', []))
+        counts = {'all': len(data), 'index': 0, 'stock': 0, 'etf': 0, 'custom': 0}
+        for item in data:
+            counts[_classify_code(item['code'])] += 1
+            if item['code'] in custom:
+                counts['custom'] += 1
+        for tid, tlabel in _TABS:
+            n = counts.get(tid, 0)
+            suffix = f' {n}' if n else ''
+            self._tab_btns[tid].setText(tlabel + suffix)
+
+    def _filtered_data(self, data: list) -> list:
+        if self._active_tab == 'all':
+            return data
+        if self._active_tab == 'custom':
+            custom = set(cfg.get('stock.custom_group', []))
+            return [d for d in data if d['code'] in custom]
+        return [d for d in data if _classify_code(d['code']) == self._active_tab]
+
+    def _render_table(self, data: list):
+        rows = self._filtered_data(data)
+        self.table.setRowCount(len(rows))
+        for ri, item in enumerate(rows):
             chg_pct = item['change_pct']
             chg     = item['change']
             sign    = '+' if chg_pct > 0 else ''
             color   = NC['red'] if chg_pct > 0 else (NC['green'] if chg_pct < 0 else NC['text'])
-
             cells = [
                 (item['code'],                    NC['dim']),
                 (item['name'],                    NC['text']),
@@ -293,8 +382,70 @@ class StockWidget(QWidget):
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(ri, col, cell)
 
-            # 涨跌提醒检查
-            code = item['code']
+    def _show_context_menu(self, pos: QPoint):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        code_item = self.table.item(row, 0)
+        name_item = self.table.item(row, 1)
+        if not code_item:
+            return
+        code = code_item.text()
+        name = name_item.text() if name_item else code
+        custom = set(cfg.get('stock.custom_group', []))
+        in_custom = code in custom
+
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background:#07111f; border:1px solid {NC['border']};
+                color:{NC['text']}; padding:4px; border-radius:6px;
+            }}
+            QMenu::item {{ padding:6px 20px 6px 12px; border-radius:3px; }}
+            QMenu::item:selected {{ background:{NC['border']}; color:{NC['cyan']}; }}
+            QMenu::separator {{ background:{NC['border']}; height:1px; margin:3px 6px; }}
+        """)
+
+        lbl = menu.addAction(f"  {name}（{code}）")
+        lbl.setEnabled(False)
+        menu.addSeparator()
+
+        if in_custom:
+            act_toggle = menu.addAction("☆  从「自选」分组移除")
+        else:
+            act_toggle = menu.addAction("★  加入「自选」分组")
+
+        menu.addSeparator()
+        act_del = menu.addAction("✕  从自选股删除")
+
+        action = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if action == act_toggle:
+            self._toggle_custom(code, in_custom)
+        elif action == act_del:
+            self._remove_by_code(code)
+
+    def _toggle_custom(self, code: str, currently_in: bool):
+        custom = cfg.get('stock.custom_group', [])
+        if currently_in:
+            custom = [c for c in custom if c != code]
+        else:
+            if code not in custom:
+                custom.append(code)
+        cfg.set('stock.custom_group', custom)
+        self._update_tab_counts(self._last_data)
+        if self._active_tab == 'custom':
+            self._render_table(self._last_data)
+
+    def _on_data(self, data: list):
+        self.lbl_last_update.setText(datetime.now().strftime('%H:%M:%S'))
+        self._last_data = data
+        self._update_tab_counts(data)
+        self._render_table(data)
+
+        alerted_this_batch = []
+        for item in data:
+            chg_pct = item['change_pct']
+            code    = item['code']
             if self._is_trading_time() and abs(chg_pct) >= self._alert_threshold and code not in self._alerted:
                 self._alerted.add(code)
                 alerted_this_batch.append((item['name'], chg_pct, item['price']))
@@ -344,7 +495,9 @@ class StockWidget(QWidget):
         code_item = self.table.item(row, 0)
         if not code_item:
             return
-        code  = code_item.text()
+        self._remove_by_code(code_item.text())
+
+    def _remove_by_code(self, code: str):
         codes = cfg.get('stock.watchlist', [])
         names = cfg.get('stock.watchlist_names', [])
         if code in codes:
@@ -354,5 +507,12 @@ class StockWidget(QWidget):
                 names.pop(idx)
             cfg.set('stock.watchlist', codes)
             cfg.set('stock.watchlist_names', names)
+        # 同步从自选分组移除
+        custom = cfg.get('stock.custom_group', [])
+        if code in custom:
+            cfg.set('stock.custom_group', [c for c in custom if c != code])
         self._alerted.discard(code)
-        self.table.removeRow(row)
+        self._last_data = [d for d in self._last_data if d['code'] != code]
+        self._update_tab_counts(self._last_data)
+        self._render_table(self._last_data)
+        self._refresh()
