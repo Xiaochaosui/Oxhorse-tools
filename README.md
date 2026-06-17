@@ -33,6 +33,9 @@ PyQt6 无边框多浮窗 + 系统托盘管理，Linux X11 原生运行。
 ### 📈 STATS · 健康统计
 ![STATS](assets/imgs/STATS.png)
 
+### ⏳ LIFELOG · 时间胶囊
+![LIFELOG](assets/imgs/LIFELOG.png)
+
 ---
 
 ## 环境要求
