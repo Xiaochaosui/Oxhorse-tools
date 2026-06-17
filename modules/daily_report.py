@@ -1,6 +1,6 @@
 """
-每日收盘报告 — 腾讯财经HTTP日K + Claude分析 + HTML输出
-触发时机：每个交易日 15:05 后自动生成，也可手动触发
+每日收盘报告 — 腾讯财经HTTP日K + AI分析 + HTML输出
+触发时机：每个交易日 16:30 后自动生成，也可手动触发
 """
 import re
 import threading
@@ -20,6 +20,12 @@ import modules.config_manager as cfg
 
 # 腾讯财经日K（HTTP，可穿透代理）
 TENCENT_KLINE_URL = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+# 东方财富行情/资金流接口（HTTPS，非交易时段也稳定）
+EM_BASE    = "https://push2.eastmoney.com/api/qt"
+EM_HEADERS = {
+    "Referer":    "https://data.eastmoney.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
 REPORTS_DIR = Path(__file__).parent.parent / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
@@ -144,71 +150,227 @@ def _get_name(code: str) -> str:
         return code
 
 
-def _fetch_all_stocks() -> dict[str, list[dict]]:
-    """并发获取所有自选股 K 线"""
+def _code_to_secid(code: str) -> str:
+    """sh000001 → 1.000001 / sz002281 → 0.002281"""
+    code = code.lower()
+    prefix = "1" if code.startswith("sh") else "0"
+    return f"{prefix}.{code[2:]}"
+
+
+def _fetch_money_flow(code: str) -> dict:
+    """
+    从东方财富获取单只股票当日资金流数据。
+    返回: {main_net, main_net_pct, amount, super_net, big_net, mid_net, small_net}
+    全部获取失败时返回空字典 {}。
+    字段说明:
+        f62  = 主力净流入(元) = 超大单 + 大单
+        f184 = 主力净流入占比(%)
+        f48  = 成交额(元)
+        f66  = 超大单净流入(元)  f69 = 超大单净占比
+        f72  = 大单净流入(元)    f75 = 大单净占比
+        f78  = 中单净流入(元)    f81 = 中单净占比
+        f84  = 小单净流入(元)    f87 = 小单净占比
+    """
+    import json as _json
+    secid = _code_to_secid(code)
+    fields = "f43,f48,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87"
+    try:
+        r = requests.get(
+            f"{EM_BASE}/stock/get",
+            params={"secid": secid, "fields": fields},
+            headers=EM_HEADERS, timeout=8,
+        )
+        d = r.json().get("data", {})
+        if not d:
+            return {}
+        def _val(key):
+            v = d.get(key)
+            return float(v) if isinstance(v, (int, float)) else None
+        return {
+            "amount":       _val("f48"),   # 成交额(元)
+            "main_net":     _val("f62"),   # 主力净流入(元)
+            "main_net_pct": _val("f184"),  # 主力净流入占比(%)
+            "super_net":    _val("f66"),   # 超大单净流入(元)
+            "super_pct":    _val("f69"),
+            "big_net":      _val("f72"),   # 大单净流入(元)
+            "big_pct":      _val("f75"),
+            "mid_net":      _val("f78"),   # 中单净流入(元)
+            "mid_pct":      _val("f81"),
+            "small_net":    _val("f84"),   # 小单净流入(元)
+            "small_pct":    _val("f87"),
+        }
+    except Exception:
+        return {}
+
+
+def _fetch_hot_sectors(top_n: int = 5) -> list[dict]:
+    """
+    获取今日主力净流入 TOP-N 板块。
+    返回: [{"name": "电力设备", "main_net": 7.7e9, "main_net_pct": 4.14}, ...]
+    """
+    try:
+        r = requests.get(
+            f"{EM_BASE}/clist/get",
+            params={
+                "pn": 1, "pz": top_n, "po": 1, "np": 1,
+                "fltt": 2, "invt": 2, "fid": "f62",
+                "fs": "m:90+t:2",
+                "fields": "f12,f14,f62,f184",
+            },
+            headers=EM_HEADERS, timeout=8,
+        )
+        items = r.json().get("data", {}).get("diff", [])
+        return [
+            {"name": it["f14"], "main_net": it.get("f62", 0), "main_net_pct": it.get("f184", 0)}
+            for it in items if it.get("f62") is not None
+        ]
+    except Exception:
+        return []
+
+
+def _fetch_all_stocks() -> tuple[dict[str, list[dict]], dict[str, dict]]:
+    """并发获取所有自选股 K 线 + 资金流，返回 (klines_map, flow_map)"""
     codes = cfg.get('stock.watchlist', [])
-    results = {}
+    klines_map: dict[str, list[dict]] = {}
+    flow_map:   dict[str, dict]       = {}
     threads = []
 
     def _worker(c):
-        results[c] = _fetch_klines(c, days=20)
+        klines_map[c] = _fetch_klines(c, days=20)
+        flow_map[c]   = _fetch_money_flow(c)
 
     for code in codes:
         t = threading.Thread(target=_worker, args=(code,), daemon=True)
         threads.append(t); t.start()
     for t in threads:
-        t.join(timeout=20)
-    return results
+        t.join(timeout=25)
+    return klines_map, flow_map
 
 
 # ── Claude 分析 ─────────────────────────────────────────────────────────────
 
-def _build_prompt(stocks_data: dict[str, list[dict]]) -> str:
+def _fmt_yuan(v) -> str:
+    """将元数值格式化为易读字符串，None 返回 '-'"""
+    if v is None:
+        return "-"
+    sign = "+" if v >= 0 else ""
+    abs_v = abs(v)
+    if abs_v >= 1e8:
+        return f"{sign}{v/1e8:.2f}亿"
+    if abs_v >= 1e4:
+        return f"{sign}{v/1e4:.0f}万"
+    return f"{sign}{v:.0f}"
+
+
+def _build_prompt(stocks_data: dict[str, list[dict]], flow_map: dict[str, dict] | None = None) -> str:
     today = date.today().strftime('%Y-%m-%d')
+    flow_map = flow_map or {}
+
+    # ── 板块资金热度 ──────────────────────────────────────────────────────────
+    hot_sectors = _fetch_hot_sectors(top_n=5)
+    sector_lines = []
+    for s in hot_sectors:
+        sector_lines.append(
+            f"  - {s['name']}：主力净流入 {_fmt_yuan(s['main_net'])}（占比 {s['main_net_pct']:+.2f}%）"
+        )
+
     lines = [
-        f"今天是 {today}，以下是我关注的A股/ETF标的近20个交易日的日K数据，请给出专业收盘分析报告。",
+        f"你是一位专业的A股量化分析师。今天是 {today}，以下是我持仓/关注的A股与ETF标的数据，请给出精准、有操作价值的收盘分析报告。",
         "",
-        "## 各标的数据（格式：日期 | 开盘 | 收盘 | 最高 | 最低 | 成交量亿 | 涨跌幅%）",
     ]
+
+    # ── 大盘板块背景 ──────────────────────────────────────────────────────────
+    if sector_lines:
+        lines += [
+            "## 今日板块资金热度（主力净流入 TOP5）",
+            *sector_lines,
+            "",
+        ]
+
+    # ── 各标的数据 ────────────────────────────────────────────────────────────
+    lines.append("## 各标的数据")
+    lines.append("K线格式：日期 | 开盘 | 收盘 | 最高 | 最低 | 成交量(万股) | 成交额 | 涨跌幅")
+
     for code, klines in stocks_data.items():
         if not klines:
-            lines.append(f"\n### {code} — 数据获取失败，请忽略")
+            lines.append(f"\n### {code} — 数据获取失败，跳过")
             continue
         name = klines[-1].get('name', code)
+        flow = flow_map.get(code, {})
+
         lines.append(f"\n### {name}（{code}）")
-        for k in klines:
+
+        # 资金流摘要（今日）
+        if flow:
+            amt      = _fmt_yuan(flow.get("amount"))
+            main_net = _fmt_yuan(flow.get("main_net"))
+            main_pct = f"{flow['main_net_pct']:+.2f}%" if flow.get("main_net_pct") is not None else "-"
+            super_net = _fmt_yuan(flow.get("super_net"))
+            big_net   = _fmt_yuan(flow.get("big_net"))
+            mid_net   = _fmt_yuan(flow.get("mid_net"))
+            small_net = _fmt_yuan(flow.get("small_net"))
             lines.append(
-                f"{k['date']} | {k['open']:.3f} | {k['close']:.3f} | "
-                f"{k['high']:.3f} | {k['low']:.3f} | "
-                f"{k['volume']/1e8:.2f}亿 | {k['chg_pct']:+.2f}%"
+                f"**今日资金流**：成交额={amt} | "
+                f"主力净={main_net}({main_pct}) | "
+                f"超大单净={super_net} | 大单净={big_net} | "
+                f"中单净={mid_net} | 小单净={small_net}"
             )
 
+        # 近20日K线
+        lines.append("近20日K线：")
+        for k in klines:
+            vol_wan = k['volume'] / 100 if k['volume'] > 1e6 else k['volume'] / 100
+            # 成交额：若K线有额则用，否则用量×收盘价估算
+            amt_str = _fmt_yuan(k.get('amount') or k['volume'] * k['close'])
+            lines.append(
+                f"{k['date']} | {k['open']:.2f} | {k['close']:.2f} | "
+                f"{k['high']:.2f} | {k['low']:.2f} | "
+                f"{vol_wan:.0f}万股 | {amt_str} | {k['chg_pct']:+.2f}%"
+            )
+
+    # ── 分析要求 ──────────────────────────────────────────────────────────────
     lines += [
         "",
         "## 分析要求",
-        "请用中文，对每个有数据的标的分别分析（跳过数据失败的）：",
-        "1. **今日表现**：涨跌幅评价、量价配合情况、有无异常信号",
-        "2. **近期趋势**：5/10/20日均线方向，当前关键支撑位和压力位",
-        "3. **操作建议**：持有/关注/谨慎，给出简洁理由",
+        "请用中文，对每个有数据的标的**逐一分析**（数据失败的跳过）：",
         "",
-        "最后输出：",
-        "- **整体市场研判**（2-3句，概括今日大盘与板块情绪）",
-        "- **明日重点关注**（3-5条 bullet，具体说明关注点）",
+        "1. **今日量价与资金**",
+        "   - 涨跌幅 + 成交量较前日变化（放量/缩量/天量）",
+        "   - 主力净流入方向与力度（流入/流出多少亿）",
+        "   - 超大单与大单的分歧：是否与主力方向一致",
+        "   - 量价是否背离（如涨价缩量、跌价放量等异常信号）",
         "",
-        "输出用 Markdown 格式，语气专业直接，不要过分保守，给出明确判断。",
+        "2. **近期趋势与位置**",
+        "   - 5/10/20日均线的方向与多空排列",
+        "   - 当前收盘价所处的支撑位 / 压力位",
+        "   - 是否处于关键位（突破/回踩/区间震荡）",
+        "",
+        "3. **操作建议**（给出明确结论，不要含糊）",
+        "   - 建议：买入 / 持有 / 减仓 / 观望 / 止损",
+        "   - 理由：结合量价 + 资金流综合判断，不超过3句",
+        "   - 风险提示：最主要的一个下行风险",
+        "",
+        "最后统一输出：",
+        "- **整体市场研判**：结合板块资金热度与个股表现，判断今日市场风格（成长/价值/防御/题材）",
+        "- **明日重点关注**（3-5条）：哪些标的在什么条件下可介入/加仓/止损",
+        "",
+        "输出用 Markdown 格式，语气专业直接，量化具体数字，不要泛泛而谈。",
     ]
     return '\n'.join(lines)
 
 
 def _call_claude(prompt: str, on_progress=None) -> str:
-    """使用 streaming 调用 Claude API，避免长请求被网关 524 超时"""
-    import os
-    api_key = os.environ.get('ANTHROPIC_AUTH_TOKEN') or os.environ.get('ANTHROPIC_API_KEY')
+    """使用 streaming 调用 AI API，避免长请求被网关 524 超时"""
+    llm = cfg.get_llm()
+    api_key  = llm['api_key']
+    base_url = llm['base_url'].rstrip('/')
+    model    = llm['model']
+    max_tok  = llm['max_tokens']
+    timeout  = llm['timeout']
     if not api_key:
-        return "⚠️ 未找到 Claude API Key，请设置环境变量 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY"
-    base_url = os.environ.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com').rstrip('/')
+        return "⚠️ 未找到 API Key，请在 config/llm.json 中配置 api_key"
     if on_progress:
-        on_progress("正在调用 Claude 分析（流式输出，约30-60秒）...")
+        on_progress(f"正在调用 {model} 分析（流式输出，约30-60秒）...")
     try:
         import json as _json
         url = f"{base_url}/v1/messages"
@@ -218,12 +380,12 @@ def _call_claude(prompt: str, on_progress=None) -> str:
             "content-type": "application/json",
         }
         body = {
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 4096,
+            "model": model,
+            "max_tokens": max_tok,
             "stream": True,
             "messages": [{"role": "user", "content": prompt}],
         }
-        r = requests.post(url, headers=headers, json=body, timeout=120, stream=True)
+        r = requests.post(url, headers=headers, json=body, timeout=timeout, stream=True)
         r.raise_for_status()
         text = ""
         for line in r.iter_lines():
@@ -329,7 +491,7 @@ pre {{ background:#0a1a2a; border:1px solid #1a3a5c; border-radius:6px;
 <body>
 <div class="hd">
   <h1>📊 每日收盘分析报告</h1>
-  <div class="meta">❯ generated at {generated_at} &nbsp;// powered by Claude Sonnet</div>
+  <div class="meta">❯ generated at {generated_at} &nbsp;// powered by DeepSeek</div>
 </div>
 <div class="chips">{''.join(chips)}</div>
 <div class="body">{_md_to_html(analysis)}</div>
@@ -342,14 +504,18 @@ def generate_report(on_progress=None, on_done=None):
     """后台线程生成报告；on_progress(msg:str)，on_done(path:str, err:str|None)"""
     def _run():
         try:
-            if on_progress: on_progress("正在获取行情数据...")
-            stocks_data = _fetch_all_stocks()
+            if on_progress: on_progress("正在获取行情数据与资金流...")
+            klines_map, flow_map = _fetch_all_stocks()
 
-            success = sum(1 for v in stocks_data.values() if v)
-            if on_progress: on_progress(f"获取完成（{success}/{len(stocks_data)} 只成功），正在分析...")
+            success = sum(1 for v in klines_map.values() if v)
+            flow_ok = sum(1 for v in flow_map.values() if v)
+            if on_progress: on_progress(
+                f"获取完成（K线 {success}/{len(klines_map)} 只，资金流 {flow_ok}/{len(flow_map)} 只），正在分析..."
+            )
 
-            prompt   = _build_prompt(stocks_data)
+            prompt   = _build_prompt(klines_map, flow_map)
             analysis = _call_claude(prompt, on_progress)
+            stocks_data = klines_map
 
             if on_progress: on_progress("正在生成 HTML...")
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -413,7 +579,7 @@ class ReportPanel(QFrame):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8); lay.setSpacing(8)
 
-        self.lbl = QLabel("📋 收盘报告  //  每日 15:05 自动生成")
+        self.lbl = QLabel("📋 收盘报告  //  每日 16:30 自动生成")
         self.lbl.setStyleSheet(f"color:{NC['dim']};font-size:11px;border:none;")
 
         # 开关按钮
@@ -467,7 +633,7 @@ class ReportPanel(QFrame):
         self.btn_toggle.setStyleSheet(self._toggle_style())
         self.btn_gen.setEnabled(self._enabled)
         if self._enabled:
-            self._set_status("📋 收盘报告已开启  //  每日 15:05 自动生成", NC['dim'])
+            self._set_status("📋 收盘报告已开启  //  每日 16:30 自动生成", NC['dim'])
         else:
             self._set_status("📋 收盘报告已关闭", NC['dim'])
 

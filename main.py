@@ -6,6 +6,12 @@ Work Assistant - 上班族效率小工具
 import sys
 import os
 import json
+
+# 必须在 QApplication 创建之前设置，让 Qt 通过 XIM 协议连接 fcitx，
+# 不依赖任何 Qt 输入法插件（解决 miniconda PyQt6 与系统 fcitx 插件 ABI 不兼容问题）
+os.environ.setdefault('QT_IM_MODULE', 'fcitx')
+os.environ.setdefault('XMODIFIERS', '@im=fcitx')
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 # 首次运行：为缺失的 config/*.json 生成默认文件
@@ -28,6 +34,7 @@ from modules.salary_clock import SalaryClockWidget
 from modules.reminders import RemindersWidget
 from modules.stock_monitor import StockWidget
 from modules.todo_feishu import TodoWidget
+from modules.weekly_report import WeeklyReportWidget
 from modules.settings_window import SettingsWindow
 from modules.health_stats import HealthStatsWindow
 from modules.lifelog import LifeLogWindow
@@ -38,40 +45,54 @@ import modules.lifelog_db as lifelog_db
 # ── 窗口配置 ──────────────────────────────────────────────────────────────
 WINDOWS_CONFIG = [
     {
-        'id':     'clock',
-        'title':  'CLOCK  //  工作时钟',
-        'emoji':  '⏰',
-        'width':  520,
-        'height': 580,
-        'widget': SalaryClockWidget,
-        'offset': (0, 0),     # 相对右下角的偏移（右→左, 下→上）
+        'id':      'clock',
+        'title':   'CLOCK  //  工作时钟',
+        'emoji':   '⏰',
+        'width':   520,
+        'height':  580,
+        'widget':  SalaryClockWidget,
+        'offset':  (0, 0),
+        'visible': True,
     },
     {
-        'id':     'remind',
-        'title':  'REMIND  //  提醒',
-        'emoji':  '🔔',
-        'width':  500,
-        'height': 680,
-        'widget': RemindersWidget,
-        'offset': (540, 0),
+        'id':      'remind',
+        'title':   'REMIND  //  提醒',
+        'emoji':   '🔔',
+        'width':   500,
+        'height':  680,
+        'widget':  RemindersWidget,
+        'offset':  (540, 0),
+        'visible': True,
     },
     {
-        'id':     'stock',
-        'title':  'STOCK  //  盯盘',
-        'emoji':  '📊',
-        'width':  560,
-        'height': 460,
-        'widget': StockWidget,
-        'offset': (0, 620),
+        'id':      'stock',
+        'title':   'STOCK  //  盯盘',
+        'emoji':   '📊',
+        'width':   560,
+        'height':  460,
+        'widget':  StockWidget,
+        'offset':  (0, 620),
+        'visible': False,
     },
     {
-        'id':     'todo',
-        'title':  'TODO  //  飞书',
-        'emoji':  '✓',
-        'width':  560,
-        'height': 560,
-        'widget': TodoWidget,
-        'offset': (580, 620),
+        'id':      'todo',
+        'title':   'TODO  //  飞书',
+        'emoji':   '✓',
+        'width':   560,
+        'height':  560,
+        'widget':  TodoWidget,
+        'offset':  (580, 620),
+        'visible': False,
+    },
+    {
+        'id':      'weekly',
+        'title':   'WEEKLY  //  周报',
+        'emoji':   '📝',
+        'width':   560,
+        'height':  620,
+        'widget':  WeeklyReportWidget,
+        'offset':  (1160, 620),
+        'visible': False,
     },
 ]
 
@@ -173,7 +194,11 @@ class FloatWindow(QWidget):
 
     def _apply_flags(self, pinned: bool, show: bool = True):
         """设置/取消置顶 flag（需要短暂隐藏再显示）"""
-        flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        # Tool 类型在 X11 上会被 fcitx 拒绝发送输入法事件，改用普通 Window
+        flags = (Qt.WindowType.FramelessWindowHint |
+                 Qt.WindowType.Window |
+                 Qt.WindowType.WindowMinimizeButtonHint |  # 隐藏任务栏按钮
+                 Qt.WindowType.WindowCloseButtonHint)
         if pinned:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         was_visible = self.isVisible()
@@ -331,6 +356,16 @@ class FloatWindow(QWidget):
         self._resize_start_geom = None
         self._resize_start_pos  = None
 
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        if hasattr(self, '_tray_action'):
+            self._tray_action.setChecked(False)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if hasattr(self, '_tray_action'):
+            self._tray_action.setChecked(True)
+
     def resizeEvent(self, e):
         c = self.findChild(QFrame, "container")
         if c:
@@ -381,6 +416,7 @@ class App:
                 'x': win.x(), 'y': win.y(),
                 'w': win.width(), 'h': win.height(),
                 'pinned': win._pinned,
+                'visible': win.isVisible(),
             })
             saved[wid] = entry
         _save_positions(saved)
@@ -418,6 +454,19 @@ class App:
                 x = max(0, min(entry['x'], sw_s - win.width()))
                 y = max(0, min(entry['y'], sh_s - win.height()))
                 win.move(x, y)
+
+    def show_default(self):
+        """首次启动按 WINDOWS_CONFIG 的 visible 决定显示哪些窗口；
+        已有保存位置的窗口按上次的可见状态恢复。"""
+        saved = _load_positions()
+        for wc in WINDOWS_CONFIG:
+            wid = wc['id']
+            win = self._windows[wid]
+            if wid in saved and 'visible' in saved[wid]:
+                if saved[wid]['visible']:
+                    win.show()
+            elif wc.get('visible', False):
+                win.show()
 
     def show_all(self):
         for win in self._windows.values():
@@ -461,13 +510,14 @@ class App:
         menu.addSeparator()
 
         # 各窗口独立显示切换
-        for cfg in WINDOWS_CONFIG:
-            wid = cfg['id']
-            act = QAction(f"{cfg['emoji']}  {cfg['title']}", menu)
-            act.setCheckable(True)
-            act.setChecked(True)
+        for wc in WINDOWS_CONFIG:
+            wid = wc['id']
             win = self._windows[wid]
-            act.triggered.connect(lambda checked, w=win: w.show() if checked else w.hide())
+            act = QAction(f"{wc['emoji']}  {wc['title']}", menu)
+            act.setCheckable(True)
+            act.setChecked(win.isVisible())
+            act.triggered.connect(lambda checked, w=win, a=act: (w.show() if checked else w.hide()))
+            win._tray_action = act
             menu.addAction(act)
 
         menu.addSeparator()
@@ -543,7 +593,6 @@ class App:
 
         self._clip_mon = ClipboardMonitor(QApplication.instance().clipboard())
         self._clip_mon.new_clip.connect(self._on_clipboard)
-        self._clip_mon.start()
 
     def _on_window_change(self, app: str, title: str, shot: str):
         if self._lifelog_recording:
@@ -586,6 +635,6 @@ if __name__ == '__main__':
     app.setStyleSheet(DARK_TECH)
 
     wa = App()
-    wa.show_all()
+    wa.show_default()
 
     sys.exit(app.exec())

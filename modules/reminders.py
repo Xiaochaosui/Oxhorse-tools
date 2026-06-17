@@ -462,22 +462,28 @@ class RemindersWidget(QWidget):
         if self._water_count_date != now.date() or self._move_count_date != now.date():
             self._load_today_progress_from_db()
 
-        # 午休 / 下班：暂停水和动的计时
+        # 仅 WORKING / OVERTIME 时计时，其余状态全部冻结
         sess_state = self._session.state
-        in_break   = sess_state in (WorkState.LUNCH_BREAK, WorkState.OFF_WORK)
+        in_break   = sess_state not in (WorkState.WORKING, WorkState.OVERTIME)
         if in_break:
             self._last_water     = now
             self._last_move      = now
             self._notified_water = False
             self._notified_move  = False
             pause_style = f"color:{NC['dim']};font-size:22px;font-weight:bold;"
-            self.lbl_water_countdown.setText("休息中")
+            if sess_state == WorkState.LUNCH_BREAK:
+                pause_tip = "午休中暂停"
+            elif sess_state == WorkState.OFF_WORK:
+                pause_tip = "下班后暂停"
+            else:
+                pause_tip = "未上班"
+            self.lbl_water_countdown.setText("--")
             self.lbl_water_countdown.setStyleSheet(pause_style)
-            self.lbl_water_tip.setText("休息 / 下班期间暂停")
+            self.lbl_water_tip.setText(pause_tip)
             self._water_ripple.set_remaining_pct(1.0, urgent=False)
-            self.lbl_move_countdown.setText("休息中")
+            self.lbl_move_countdown.setText("--")
             self.lbl_move_countdown.setStyleSheet(pause_style)
-            self.lbl_move_tip.setText("休息 / 下班期间暂停")
+            self.lbl_move_tip.setText(pause_tip)
             self._move_timer_widget.set_state(1.0, urgent=False)
             self._tick_meal(now, reminder)
             return

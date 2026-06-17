@@ -3,7 +3,6 @@ TODO 模块 - 飞书多维表格（Bitable）集成
 支持：新增 / 完成 / 删除 / 备注展开编辑
 """
 import threading
-import time
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
@@ -14,6 +13,55 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QColor, QFont
 from modules.theme import NEON_COLORS as NC
 import modules.config_manager as cfg
+from modules.feishu_client import FeishuClient as _SDK, FeishuError
+
+
+_PRIORITY_MAP = {
+    'P0': '🔴P0-高优',
+    'P1': '🟡P1-一般',
+    'P2': '🟢P2-低优',
+}
+_PRIORITY_MAP_REV = {v: k for k, v in _PRIORITY_MAP.items()}
+
+
+def _parse_priority(raw: str) -> str:
+    """'🔴P0-高优' → 'P0'，兼容纯 'P0' 格式。"""
+    s = str(raw)
+    if s in _PRIORITY_MAP_REV:
+        return _PRIORITY_MAP_REV[s]
+    for p in ('P0', 'P1', 'P2'):
+        if p in s:
+            return p
+    return 'P2'
+
+
+def _parse_status(f: dict) -> str:
+    """兼容布尔 '是否已完成' 和字符串 '状态' 两种字段。"""
+    if '是否已完成' in f:
+        return '已完成' if f['是否已完成'] else '待处理'
+    return str(f.get('状态', f.get('status', '待处理')))
+
+
+def _parse_created(val) -> str:
+    if isinstance(val, (int, float)):
+        from datetime import datetime
+        return datetime.fromtimestamp(val / 1000).strftime('%Y-%m-%d %H:%M')
+    return str(val) if val else ''
+
+
+def _parse_record(item: dict) -> dict:
+    f = item.get('fields', {})
+    title = str(f.get('待办事项', f.get('标题', f.get('title', ''))))
+    note_raw = f.get('备注', f.get('note', ''))
+    note = str(note_raw) if note_raw else ''
+    return {
+        'record_id': item.get('record_id', ''),
+        'title':    title,
+        'status':   _parse_status(f),
+        'priority': _parse_priority(f.get('优先级', f.get('priority', 'P2'))),
+        'note':     note,
+        'created':  _parse_created(f.get('创建时间', '')),
+    }
 
 
 PRIORITY_COLORS = {
@@ -43,111 +91,72 @@ _GROUP_STYLE = f"""
 
 
 class FeishuClient(QObject):
-    data_ready  = pyqtSignal(list)
-    sync_done   = pyqtSignal(bool, str)
+    """Qt 信号桥：在后台线程调用 _SDK，结果通过信号回到主线程。"""
+    data_ready = pyqtSignal(list)
+    sync_done  = pyqtSignal(bool, str)
 
     def __init__(self):
         super().__init__()
-        self._token = None
-        self._token_expiry = 0
+        self._sdk = _SDK()
+        self._refresh_creds()
 
-    def _get_token(self, app_id: str, app_secret: str) -> str:
-        import requests
-        if self._token and time.time() < self._token_expiry - 60:
-            return self._token
-        resp = requests.post(
-            'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-            json={'app_id': app_id, 'app_secret': app_secret}, timeout=10
-        )
-        data = resp.json()
-        self._token = data.get('tenant_access_token', '')
-        self._token_expiry = time.time() + data.get('expire', 7200)
-        return self._token
-
-    def _creds(self):
-        return (
-            cfg.get('feishu.bitable_app_token', ''),
-            cfg.get('feishu.bitable_table_id', ''),
+    def _refresh_creds(self):
+        self._sdk.configure(
             cfg.get('feishu.app_id', ''),
             cfg.get('feishu.app_secret', ''),
         )
 
-    def fetch_records(self):
-        threading.Thread(target=self._fetch_run, args=self._creds(), daemon=True).start()
+    def _creds(self):
+        return cfg.get('feishu.bitable_app_token', ''), cfg.get('feishu.bitable_table_id', '')
 
-    def _fetch_run(self, app_token, table_id, app_id, app_secret):
+    def _run(self, fn, *args):
+        threading.Thread(target=fn, args=args, daemon=True).start()
+
+    def fetch_records(self):
+        self._refresh_creds()
+        self._run(self._fetch_run, *self._creds())
+
+    def _fetch_run(self, app_token, table_id):
         try:
-            import requests
-            token = self._get_token(app_id, app_secret)
-            headers = {'Authorization': f'Bearer {token}'}
-            url = f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records'
-            params = {'page_size': 100}
+            raw = self._sdk.bitable_list(app_token, table_id)
             records = []
-            while True:
-                resp = requests.get(url, headers=headers, params=params, timeout=10)
-                data = resp.json().get('data', {})
-                for item in data.get('items', []):
-                    f = item.get('fields', {})
-                    records.append({
-                        'record_id': item.get('record_id', ''),
-                        'title':    str(f.get('标题', f.get('title', ''))),
-                        'status':   str(f.get('状态', f.get('status', '待处理'))),
-                        'priority': str(f.get('优先级', f.get('priority', 'P2'))),
-                        'note':     str(f.get('备注', f.get('note', ''))),
-                        'created':  str(f.get('创建时间', '')),
-                    })
-                if not data.get('has_more') or not data.get('page_token'):
-                    break
-                params['page_token'] = data['page_token']
+            for item in raw:
+                f = item.get('fields', {})
+                records.append(_parse_record(item))
             self.data_ready.emit(records)
         except Exception:
             self.data_ready.emit([])
 
     def add_record(self, fields: dict):
-        threading.Thread(target=self._add_run, args=(*self._creds(), fields), daemon=True).start()
+        self._refresh_creds()
+        self._run(self._add_run, *self._creds(), fields)
 
-    def _add_run(self, app_token, table_id, app_id, app_secret, fields):
+    def _add_run(self, app_token, table_id, fields):
         try:
-            import requests
-            token = self._get_token(app_id, app_secret)
-            headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-            url = f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records'
-            resp = requests.post(url, headers=headers, json={'fields': fields}, timeout=10)
-            d = resp.json()
-            ok = d.get('code', -1) == 0
-            # 返回新 record_id
-            rid = d.get('data', {}).get('record', {}).get('record_id', '')
-            self.sync_done.emit(ok, rid if ok else d.get('msg', '失败'))
+            rid = self._sdk.bitable_add(app_token, table_id, fields)
+            self.sync_done.emit(True, rid)
         except Exception as e:
             self.sync_done.emit(False, str(e))
 
     def update_record(self, record_id: str, fields: dict):
-        threading.Thread(target=self._update_run, args=(*self._creds(), record_id, fields), daemon=True).start()
+        self._refresh_creds()
+        self._run(self._update_run, *self._creds(), record_id, fields)
 
-    def _update_run(self, app_token, table_id, app_id, app_secret, record_id, fields):
+    def _update_run(self, app_token, table_id, record_id, fields):
         try:
-            import requests
-            token = self._get_token(app_id, app_secret)
-            headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-            url = f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}'
-            resp = requests.put(url, headers=headers, json={'fields': fields}, timeout=10)
-            ok = resp.json().get('code', -1) == 0
-            self.sync_done.emit(ok, 'update_ok' if ok else resp.json().get('msg', '失败'))
+            self._sdk.bitable_update(app_token, table_id, record_id, fields)
+            self.sync_done.emit(True, 'update_ok')
         except Exception as e:
             self.sync_done.emit(False, str(e))
 
     def delete_record(self, record_id: str):
-        threading.Thread(target=self._delete_run, args=(*self._creds(), record_id), daemon=True).start()
+        self._refresh_creds()
+        self._run(self._delete_run, *self._creds(), record_id)
 
-    def _delete_run(self, app_token, table_id, app_id, app_secret, record_id):
+    def _delete_run(self, app_token, table_id, record_id):
         try:
-            import requests
-            token = self._get_token(app_id, app_secret)
-            headers = {'Authorization': f'Bearer {token}'}
-            url = f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}'
-            resp = requests.delete(url, headers=headers, timeout=10)
-            ok = resp.json().get('code', -1) == 0
-            self.sync_done.emit(ok, 'delete_ok' if ok else resp.json().get('msg', '删除失败'))
+            self._sdk.bitable_delete(app_token, table_id, record_id)
+            self.sync_done.emit(True, 'delete_ok')
         except Exception as e:
             self.sync_done.emit(False, str(e))
 
@@ -187,7 +196,8 @@ class TodoWidget(QWidget):
         self.lbl_status = QLabel("TODO  //  飞书多维表格")
         self.lbl_status.setStyleSheet(f"color:{NC['dim']}; font-size:11px; letter-spacing:2px;")
         btn_sync = QPushButton("⟳  SYNC")
-        btn_sync.setFixedWidth(80)
+        btn_sync.setMinimumWidth(70)
+        btn_sync.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         btn_sync.clicked.connect(self._fetch)
         top.addWidget(self.lbl_status)
         top.addStretch()
@@ -224,42 +234,61 @@ class TodoWidget(QWidget):
         """)
         root.addWidget(self.table, 4)
 
-        # ── 备注展开面板 ──
-        self.note_frame = QFrame()
-        self.note_frame.setStyleSheet(f"""
+        # ── 编辑面板（标题编辑 / 备注）──
+        self.edit_frame = QFrame()
+        self.edit_frame.setStyleSheet(f"""
             QFrame {{
                 background:#07111f;
                 border:1px solid {NC['border']};
                 border-radius:6px;
             }}
         """)
-        note_layout = QVBoxLayout(self.note_frame)
-        note_layout.setContentsMargins(10, 8, 10, 8)
-        note_layout.setSpacing(6)
+        edit_layout = QVBoxLayout(self.edit_frame)
+        edit_layout.setContentsMargins(10, 8, 10, 8)
+        edit_layout.setSpacing(6)
 
-        note_top = QHBoxLayout()
-        self.lbl_note_title = QLabel("备注")
-        self.lbl_note_title.setStyleSheet(f"color:{NC['cyan']}; font-size:10px; letter-spacing:2px;")
-        btn_save_note = QPushButton("SAVE NOTE")
-        btn_save_note.setFixedWidth(90)
-        btn_save_note.clicked.connect(self._save_note)
-        note_top.addWidget(self.lbl_note_title)
-        note_top.addStretch()
-        note_top.addWidget(btn_save_note)
+        edit_top = QHBoxLayout()
+        self.lbl_edit_title = QLabel("备注")
+        self.lbl_edit_title.setStyleSheet(f"color:{NC['cyan']}; font-size:10px; letter-spacing:2px;")
+        self.btn_edit_save = QPushButton("SAVE")
+        self.btn_edit_save.clicked.connect(self._save_edit_panel)
+        edit_top.addWidget(self.lbl_edit_title)
+        edit_top.addStretch()
+        edit_top.addWidget(self.btn_edit_save)
 
-        self.note_edit = QTextEdit()
-        self.note_edit.setFixedHeight(60)
-        self.note_edit.setPlaceholderText("点击任意行查看/编辑备注...")
-        self.note_edit.setStyleSheet(f"""
+        # 单行编辑（标题）
+        self.edit_line = QLineEdit()
+        self.edit_line.setStyleSheet(f"""
+            QLineEdit {{
+                background:#050d18; border:none; border-bottom:1px solid {NC['border']};
+                color:{NC['text']}; font-size:12px; padding:2px 0;
+            }}
+        """)
+        self.edit_line.returnPressed.connect(self._save_edit_panel)
+        self.edit_line.hide()
+
+        # 多行编辑（备注）
+        self.edit_text = QTextEdit()
+        self.edit_text.setFixedHeight(60)
+        self.edit_text.setPlaceholderText("点击任意行查看/编辑备注...")
+        self.edit_text.setStyleSheet(f"""
             QTextEdit {{
                 background:#050d18; border:none;
                 color:{NC['text']}; font-size:12px;
             }}
         """)
-        note_layout.addLayout(note_top)
-        note_layout.addWidget(self.note_edit)
-        self.note_frame.hide()
-        root.addWidget(self.note_frame)
+
+        edit_layout.addLayout(edit_top)
+        edit_layout.addWidget(self.edit_line)
+        edit_layout.addWidget(self.edit_text)
+        self.edit_frame.hide()
+        self._edit_mode = 'note'   # 'note' | 'title' | 'priority'
+        root.addWidget(self.edit_frame)
+
+        # 向后兼容
+        self.note_frame = self.edit_frame
+        self.note_edit  = self.edit_text
+        self.lbl_note_title = self.lbl_edit_title
 
         # ── 新增 ──
         add_group = QGroupBox("NEW TASK")
@@ -273,30 +302,27 @@ class TodoWidget(QWidget):
         self.input_title.returnPressed.connect(self._add_todo)
 
         self.combo_priority = QComboBox()
-        self.combo_priority.addItems(["P0", "P1", "P2", "P3"])
-        self.combo_priority.setCurrentIndex(2)
-        self.combo_priority.setFixedWidth(55)
-
-        self.combo_status = QComboBox()
-        self.combo_status.addItems(["待处理", "进行中", "已完成", "已取消"])
-        self.combo_status.setFixedWidth(78)
+        self.combo_priority.addItems(["P0", "P1", "P2"])
+        self.combo_priority.setCurrentIndex(1)
+        self.combo_priority.setMinimumWidth(55)
+        self.combo_priority.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
 
         btn_add = QPushButton("ADD")
-        btn_add.setFixedWidth(55)
+        btn_add.setMinimumWidth(50)
+        btn_add.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         btn_add.clicked.connect(self._add_todo)
 
         ag.addWidget(self.input_title)
         ag.addWidget(self.combo_priority)
-        ag.addWidget(self.combo_status)
         ag.addWidget(btn_add)
         root.addWidget(add_group)
 
-        # ── 飞书配置 ──
+        # ── 飞书配置（两行）──
         cfg_group = QGroupBox("FEISHU CONFIG")
         cfg_group.setStyleSheet(_GROUP_STYLE)
-        cg = QHBoxLayout(cfg_group)
+        cg = QVBoxLayout(cfg_group)
         cg.setContentsMargins(10, 14, 10, 10)
-        cg.setSpacing(6)
+        cg.setSpacing(4)
 
         self.input_appid     = QLineEdit(); self.input_appid.setPlaceholderText("App ID")
         self.input_appsecret = QLineEdit(); self.input_appsecret.setPlaceholderText("App Secret")
@@ -309,13 +335,20 @@ class TodoWidget(QWidget):
         self.input_apptoken.setText(cfg.get('feishu.bitable_app_token', ''))
         self.input_tableid.setText(cfg.get('feishu.bitable_table_id', ''))
 
-        btn_cfg_save = QPushButton("SAVE")
-        btn_cfg_save.setFixedWidth(55)
+        btn_cfg_save = QPushButton("SAVE CONFIG")
         btn_cfg_save.clicked.connect(self._save_feishu_config)
 
-        for w in [self.input_appid, self.input_appsecret, self.input_apptoken, self.input_tableid]:
-            cg.addWidget(w)
-        cg.addWidget(btn_cfg_save)
+        row1 = QHBoxLayout(); row1.setSpacing(6)
+        row1.addWidget(self.input_appid)
+        row1.addWidget(self.input_appsecret)
+
+        row2 = QHBoxLayout(); row2.setSpacing(6)
+        row2.addWidget(self.input_apptoken)
+        row2.addWidget(self.input_tableid)
+        row2.addWidget(btn_cfg_save)
+
+        cg.addLayout(row1)
+        cg.addLayout(row2)
         root.addWidget(cfg_group)
 
         self._selected_record = None  # 当前选中的 record dict
@@ -334,14 +367,17 @@ class TodoWidget(QWidget):
         self._render_table(records)
         self._set_status(f"✓  {len(records)} 条  ·  {datetime.now().strftime('%H:%M:%S')}", NC['green'])
 
-    def _render_table(self, records: list):
+    def _sorted_records(self) -> list:
         order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-        records = sorted(records, key=lambda r: (
+        return sorted(self._records, key=lambda r: (
             r.get('status') == '已完成',
             order.get(r.get('priority', 'P2'), 99)
         ))
-        self.table.setRowCount(len(records))
-        for ri, item in enumerate(records):
+
+    def _render_table(self, records: list):
+        sorted_recs = self._sorted_records()
+        self.table.setRowCount(len(sorted_recs))
+        for ri, item in enumerate(sorted_recs):
             prio   = item.get('priority', 'P2')
             title  = item.get('title', '')
             status = item.get('status', '待处理')
@@ -394,42 +430,120 @@ class TodoWidget(QWidget):
             self.table.setCellWidget(ri, 4, btn_del)
 
     def _on_row_click(self, row, col):
-        if col in (3, 4):  # 按钮列不展开备注
+        if col in (3, 4):
             return
         if row < 0 or row >= len(self._records):
             return
-        # 找到排序后第 row 行对应的 record（重新排序和 _render_table 一致）
-        order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-        sorted_records = sorted(self._records, key=lambda r: (
-            r.get('status') == '已完成',
-            order.get(r.get('priority', 'P2'), 99)
-        ))
-        self._selected_record = sorted_records[row]
-        note = self._selected_record.get('note', '')
-        title = self._selected_record.get('title', '')
-        self.lbl_note_title.setText(f"备注  //  {title[:20]}")
-        self.note_edit.setPlainText(note if note != 'None' else '')
-        self.note_frame.show()
+        record = self._sorted_records()[row]
+        self._selected_record = record
+        short = record.get('title', '')[:20]
 
-    def _save_note(self):
+        if col == 0:
+            # 优先级：面板显示 ComboBox
+            self._edit_mode = 'priority'
+            self.lbl_edit_title.setText(f"优先级  //  {short}")
+            self.btn_edit_save.setText("SAVE")
+            self.edit_line.show()
+            self.edit_text.hide()
+            # 复用 edit_line 位置放 combo，但直接用独立 combo 弹窗更可靠
+            self._show_priority_panel(record)
+            return
+
+        if col == 1:
+            # 标题：面板显示单行输入框
+            self._edit_mode = 'title'
+            self.lbl_edit_title.setText(f"标题  //  {short}")
+            self.btn_edit_save.setText("SAVE")
+            self.edit_line.setText(record.get('title', ''))
+            self.edit_line.show()
+            self.edit_text.hide()
+            self.edit_frame.show()
+            self.edit_line.setFocus()
+            self.edit_line.selectAll()
+            return
+
+        # 其他列：备注
+        self._edit_mode = 'note'
+        self.lbl_edit_title.setText(f"备注  //  {short}")
+        self.btn_edit_save.setText("SAVE NOTE")
+        note = record.get('note', '')
+        self.edit_text.setPlainText(note if note != 'None' else '')
+        self.edit_line.hide()
+        self.edit_text.show()
+        self.edit_frame.show()
+
+    def _show_priority_panel(self, record: dict):
+        """在面板里显示优先级下拉。"""
+        self.edit_line.hide()
+        self.edit_text.hide()
+
+        if not hasattr(self, '_prio_combo'):
+            self._prio_combo = QComboBox()
+            self._prio_combo.addItems(["P0", "P1", "P2"])
+            self._prio_combo.setStyleSheet(f"""
+                QComboBox {{
+                    background:#050d18; color:{NC['cyan']};
+                    border:1px solid {NC['border']}; border-radius:3px;
+                    font-size:12px; padding:3px 6px;
+                }}
+                QComboBox QAbstractItemView {{
+                    background:#0a1422; color:{NC['text']};
+                    selection-background-color:#1a3a5c;
+                }}
+            """)
+            self.edit_frame.layout().addWidget(self._prio_combo)
+
+        self._prio_combo.setCurrentText(record.get('priority', 'P1'))
+        self._prio_combo.show()
+        self.edit_frame.show()
+
+    def _save_edit_panel(self):
         if not self._selected_record:
             return
-        note_text = self.note_edit.toPlainText().strip()
-        record_id = self._selected_record.get('record_id', '')
-        self._selected_record['note'] = note_text
-        if record_id and cfg.get('feishu.app_id'):
-            self._client.update_record(record_id, {'备注': note_text})
-        self._set_status("备注已保存...", NC['cyan'])
+        record = self._selected_record
+        record_id = record.get('record_id', '')
+        has_creds = bool(record_id and cfg.get('feishu.app_id'))
+
+        if self._edit_mode == 'title':
+            new_val = self.edit_line.text().strip()
+            if new_val and new_val != record.get('title'):
+                record['title'] = new_val
+                if has_creds:
+                    self._client.update_record(record_id, {'待办事项': new_val})
+                    self._set_status("⟳ 同步标题...", NC['dim'])
+            self._render_table(self._records)
+
+        elif self._edit_mode == 'priority':
+            new_val = self._prio_combo.currentText()
+            if new_val != record.get('priority'):
+                record['priority'] = new_val
+                if has_creds:
+                    self._client.update_record(record_id, {'优先级': _PRIORITY_MAP.get(new_val, '🟡P1-一般')})
+                    self._set_status("⟳ 同步优先级...", NC['dim'])
+            self._render_table(self._records)
+
+        elif self._edit_mode == 'note':
+            note_text = self.edit_text.toPlainText().strip()
+            record['note'] = note_text
+            if has_creds:
+                self._client.update_record(record_id, {'备注': note_text})
+                self._set_status("⟳ 同步备注...", NC['dim'])
+            else:
+                self._set_status("备注已保存（本地）", NC['cyan'])
+
+    # 向后兼容旧引用
+    def _save_note(self):
+        self._edit_mode = 'note'
+        self._save_edit_panel()
 
     def _add_todo(self):
         title = self.input_title.text().strip()
         if not title:
             return
         priority = self.combo_priority.currentText()
-        status   = self.combo_status.currentText()
         new_item = {
             'record_id': '', 'title': title,
-            'priority': priority, 'status': status,
+            'priority': priority, 'status': '待处理',
             'note': '', 'created': datetime.now().strftime('%Y-%m-%d %H:%M'),
         }
         self._records.append(new_item)
@@ -437,7 +551,8 @@ class TodoWidget(QWidget):
         self.input_title.clear()
         if cfg.get('feishu.app_id'):
             self._pending_add_title = title
-            self._client.add_record({'标题': title, '优先级': priority, '状态': status})
+            prio_label = _PRIORITY_MAP.get(priority, '🟡P1-一般')
+            self._client.add_record({'待办事项': title, '优先级': prio_label, '是否已完成': False})
 
     def _mark_done(self, record: dict):
         for r in self._records:
@@ -446,7 +561,7 @@ class TodoWidget(QWidget):
                 break
         self._render_table(self._records)
         if cfg.get('feishu.app_id') and record.get('record_id'):
-            self._client.update_record(record['record_id'], {'状态': '已完成'})
+            self._client.update_record(record['record_id'], {'是否已完成': True})
 
     def _delete_todo(self, record: dict):
         record_id = record.get('record_id', '')

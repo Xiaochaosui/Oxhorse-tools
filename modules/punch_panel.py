@@ -326,6 +326,12 @@ class PunchPanel(QFrame):
     def _update_time_info(self):
         s = self._session
         now = datetime.now()
+
+        # 跨天自动重置：session 记录的日期不是今天则清空
+        if s.state != WorkState.BEFORE_WORK and not s.today_punched():
+            s.reset_for_new_day()
+            return
+
         info_parts = []
         if s.work_start and s.state != WorkState.BEFORE_WORK:
             elapsed = int((now - s.work_start).total_seconds())

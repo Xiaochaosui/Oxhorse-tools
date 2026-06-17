@@ -1,14 +1,15 @@
 """
-LifeLog 后台监控线程
-- WindowMonitor  : 监测活跃窗口切换 → 截图
-- ClipboardMonitor: 监测剪贴板变化 → 存文字 / 图片
+LifeLog 后台监控
+- WindowMonitor  : 后台线程只用 xdotool 探测窗口切换（纯 subprocess，线程安全）
+                   截图通过信号派发回主线程执行（Qt GUI 操作必须在主线程）
+- ClipboardMonitor: 纯主线程 QObject，连接 QClipboard.dataChanged 信号
 """
-import re, time, hashlib, subprocess
-from pathlib import Path
+import re, hashlib, subprocess
 from datetime import datetime
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import QApplication
 
 from modules.lifelog_db import SHOTS_DIR, CLIPS_DIR
 
@@ -16,7 +17,7 @@ from modules.lifelog_db import SHOTS_DIR, CLIPS_DIR
 # ── 系统工具函数 ─────────────────────────────────────────────────────────
 
 def get_active_window() -> tuple[str, str]:
-    """返回 (app_name, window_title)"""
+    """返回 (app_name, window_title)，只用 subprocess，线程安全"""
     try:
         wid   = subprocess.check_output(["xdotool", "getactivewindow"],     stderr=subprocess.DEVNULL).decode().strip()
         title = subprocess.check_output(["xdotool", "getwindowname",  wid], stderr=subprocess.DEVNULL).decode().strip()
@@ -28,10 +29,8 @@ def get_active_window() -> tuple[str, str]:
 
 
 def take_screenshot(app_name: str) -> str:
-    """截全屏保存为 JPEG，返回文件路径，失败返回空串"""
+    """截全屏保存为 JPEG，必须在主线程调用"""
     try:
-        from PyQt6.QtWidgets import QApplication
-        from PyQt6.QtGui import QScreen
         screen = QApplication.primaryScreen()
         if screen is None:
             return ""
@@ -47,10 +46,11 @@ def take_screenshot(app_name: str) -> str:
         return ""
 
 
-# ── 窗口监控线程 ─────────────────────────────────────────────────────────
+# ── 窗口监控：后台线程只跑 xdotool ───────────────────────────────────────
 
-class WindowMonitor(QThread):
-    window_changed = pyqtSignal(str, str, str)   # app, title, shot_path
+class _WindowPoller(QThread):
+    """只负责轮询 xdotool，检测到标题变化时 emit 信号（不碰 Qt GUI）"""
+    title_changed = pyqtSignal(str, str)   # app, title
 
     def __init__(self):
         super().__init__()
@@ -58,13 +58,13 @@ class WindowMonitor(QThread):
         self._last = ""
 
     def run(self):
+        import time
         while not self._stop:
             try:
                 app, title = get_active_window()
                 if title and title != self._last:
                     self._last = title
-                    shot = take_screenshot(app)
-                    self.window_changed.emit(app, title, shot)
+                    self.title_changed.emit(app, title)
             except Exception:
                 pass
             time.sleep(1.2)
@@ -74,53 +74,68 @@ class WindowMonitor(QThread):
         self.wait(3000)
 
 
-# ── 剪贴板监控线程 ────────────────────────────────────────────────────────
+class WindowMonitor(QObject):
+    """主线程对象：收到 _WindowPoller 信号后在主线程截图，再 emit 最终结果"""
+    window_changed = pyqtSignal(str, str, str)   # app, title, shot_path
 
-class ClipboardMonitor(QThread):
+    def __init__(self):
+        super().__init__()
+        self._poller = _WindowPoller()
+        self._poller.title_changed.connect(self._on_title_changed)
+
+    def _on_title_changed(self, app: str, title: str):
+        shot = take_screenshot(app)   # 主线程执行，安全
+        self.window_changed.emit(app, title, shot)
+
+    def start(self):
+        self._poller.start()
+
+    def stop(self):
+        self._poller.stop()
+
+
+# ── 剪贴板监控：纯主线程 QObject ─────────────────────────────────────────
+
+class ClipboardMonitor(QObject):
+    """连接 QClipboard.dataChanged，全程在主线程，不启动任何子线程"""
     new_clip = pyqtSignal(str, str)   # 'text' / 'image', content_or_path
 
     def __init__(self, clipboard):
         super().__init__()
-        self._stop      = False
-        self._last_hash = ""
         self._cb        = clipboard
+        self._last_hash = ""
+        self._cb.dataChanged.connect(self._on_data_changed)
 
-    def run(self):
-        while not self._stop:
-            try:
-                self._check()
-            except Exception:
-                pass
-            time.sleep(0.8)
+    def _on_data_changed(self):
+        try:
+            mime = self._cb.mimeData()
+            if mime is None:
+                return
 
-    def _check(self):
-        mime = self._cb.mimeData()
-        if mime is None:
-            return
+            if mime.hasImage():
+                img: QImage = self._cb.image()
+                if img.isNull():
+                    return
+                raw = img.bits().asarray(img.sizeInBytes())
+                h   = hashlib.md5(bytes(raw)).hexdigest()
+                if h == self._last_hash:
+                    return
+                self._last_hash = h
+                path = CLIPS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{h[:8]}.png"
+                QPixmap.fromImage(img).save(str(path))
+                self.new_clip.emit("image", str(path))
 
-        if mime.hasImage():
-            img: QImage = self._cb.image()
-            if img.isNull():
-                return
-            raw = img.bits().asarray(img.sizeInBytes())
-            h   = hashlib.md5(bytes(raw)).hexdigest()
-            if h == self._last_hash:
-                return
-            self._last_hash = h
-            path = CLIPS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{h[:8]}.png"
-            QPixmap.fromImage(img).save(str(path))
-            self.new_clip.emit("image", str(path))
-
-        elif mime.hasText():
-            text = self._cb.text().strip()
-            if not text:
-                return
-            h = hashlib.md5(text.encode()).hexdigest()
-            if h == self._last_hash:
-                return
-            self._last_hash = h
-            self.new_clip.emit("text", text)
+            elif mime.hasText():
+                text = self._cb.text().strip()
+                if not text:
+                    return
+                h = hashlib.md5(text.encode()).hexdigest()
+                if h == self._last_hash:
+                    return
+                self._last_hash = h
+                self.new_clip.emit("text", text)
+        except Exception:
+            pass
 
     def stop(self):
-        self._stop = True
-        self.wait(3000)
+        self._cb.dataChanged.disconnect(self._on_data_changed)

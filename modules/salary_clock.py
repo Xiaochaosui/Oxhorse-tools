@@ -10,7 +10,6 @@ from PyQt6.QtCore import QTimer, Qt, QRect, QPoint, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QLinearGradient
 from modules.theme import NEON_COLORS as NC
 import modules.config_manager as cfg
-from modules.work_session import WorkSession, WorkState
 
 
 # ── 励志语句库（100 条，涵盖 AI 算法人、打工人、财富感）─────────────────────
@@ -419,8 +418,6 @@ class SalaryClockWidget(QWidget):
         super().__init__(parent)
         self._prev_earned = 0.0
         self._last_burst_earned = 0.0
-        self._session = WorkSession.instance()
-        self._session.state_changed.connect(lambda _: self._tick())
         self._build_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -575,118 +572,63 @@ class SalaryClockWidget(QWidget):
         monthly = w.get('monthly_salary', 20000)
         daily   = monthly / 21.75
 
-        # 工作会话状态
-        sess  = self._session
-        state = sess.state
+        sh, sm = map(int, w.get('start_time', '09:00').split(':'))
+        eh, em = map(int, w.get('end_time',   '18:00').split(':'))
+        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt   = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        work_day_secs = (end_dt - start_dt).total_seconds()  # 配置的标准工作时长（含午休）
 
-        # ── 计算已赚钱数 & 状态文字 ──────────────────────────────────────────
         pct    = 0.0
         earned = 0.0
 
-        if state == WorkState.BEFORE_WORK:
-            # 未打卡：按配置时间显示距上班倒计时
-            sh, sm = map(int, w.get('start_time', '09:00').split(':'))
-            start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-            if now < start_dt:
-                delta = start_dt - now
-                h, r = divmod(int(delta.total_seconds()), 3600); m, s = divmod(r, 60)
-                self._card_countdown[1].setText(f"{h:02d}:{m:02d}:{s:02d}")
-                self._card_countdown[1].setStyleSheet(f"color:{NC['yellow']};font-size:16px;font-weight:bold;")
-            else:
-                self._card_countdown[1].setText("待打卡")
-                self._card_countdown[1].setStyleSheet(f"color:{NC['orange']};font-size:16px;font-weight:bold;")
+        if now < start_dt:
+            # 上班前：倒计时
+            delta = start_dt - now
+            h, r = divmod(int(delta.total_seconds()), 3600); m, s = divmod(r, 60)
+            self._card_countdown[1].setText(f"{h:02d}:{m:02d}:{s:02d}")
+            self._card_countdown[1].setStyleSheet(f"color:{NC['yellow']};font-size:16px;font-weight:bold;")
             self.lbl_status_emoji.setText("🌅")
-            self.lbl_status_text.setText("等待打卡上班")
+            self.lbl_status_text.setText("距上班")
             self._card_earned[1].setText("¥ 0.00")
             self._rain.set_intensity(0)
 
-        elif state in (WorkState.WORKING, WorkState.OVERTIME, WorkState.LUNCH_BREAK):
-            # 按实际打卡时间计算工作时长（午休不计）
-            work_start = sess.work_start or now
-            # 扣掉午休时间
-            lunch_dur = 0
-            if sess.lunch_start:
-                lunch_end_t = sess.lunch_end or (now if state == WorkState.LUNCH_BREAK else now)
-                lunch_dur = (lunch_end_t - sess.lunch_start).total_seconds()
-
-            if state == WorkState.LUNCH_BREAK:
-                # 午休：不累计时间，显示午休时长
-                lb_secs = (now - sess.lunch_start).total_seconds()
-                lm, ls  = divmod(int(lb_secs), 60)
-                self._card_countdown[1].setText(f"午休 {lm}:{ls:02d}")
-                self._card_countdown[1].setStyleSheet(f"color:{NC['orange']};font-size:16px;font-weight:bold;")
-                self.lbl_status_emoji.setText("🍜")
-                self.lbl_status_text.setText("午休中")
-                # 用午休前的已赚
-                elapsed = max(0, (sess.lunch_start - work_start).total_seconds())
-                # 按8小时标准工作日计算
-                work_day_secs = 8 * 3600
-                pct    = min(elapsed / work_day_secs, 1.0)
-                earned = daily * pct
-                self._card_earned[1].setText(f"¥ {earned:,.2f}")
-                self._rain.set_intensity(0)
-            else:
-                # 工作中 / 加班中
-                elapsed = max(0, (now - work_start).total_seconds() - lunch_dur)
-                work_day_secs = 8 * 3600
-                pct    = min(elapsed / work_day_secs, 1.0)
-                earned = daily * pct
-
-                # 加班按1.5倍计，超出8小时部分额外计
-                if elapsed > work_day_secs:
-                    overtime_secs = elapsed - work_day_secs
-                    earned = daily + (daily / work_day_secs) * overtime_secs * 1.5
-
-                if state == WorkState.OVERTIME:
-                    self.lbl_status_emoji.setText("⚡")
-                    self.lbl_status_text.setText("加班中")
-                    self._card_countdown[1].setStyleSheet(f"color:{NC['purple']};font-size:16px;font-weight:bold;")
-                else:
-                    self.lbl_status_emoji.setText("💼")
-                    self.lbl_status_text.setText("打工中")
-                    self._card_countdown[1].setStyleSheet(f"color:{NC['cyan']};font-size:16px;font-weight:bold;")
-
-                # 剩余时间（距8小时满）
-                remain = max(0, work_day_secs - elapsed)
-                rh, rr = divmod(int(remain), 3600); rm, rs = divmod(rr, 60)
-                if elapsed >= work_day_secs:
-                    ot = int(elapsed - work_day_secs)
-                    oh, or_ = divmod(ot, 3600); om, os = divmod(or_, 60)
-                    self._card_countdown[1].setText(f"+{oh:02d}:{om:02d}:{os:02d}")
-                else:
-                    self._card_countdown[1].setText(f"{rh:02d}:{rm:02d}:{rs:02d}")
-
-                self._card_earned[1].setText(f"¥ {earned:,.2f}")
-
-                per_second = daily / work_day_secs
-                intensity  = min(0.3 + per_second / 0.5, 1.2)
-                self._rain.set_intensity(intensity)
-
-                milestone = 10.0
-                if int(earned / milestone) > int(self._last_burst_earned / milestone):
-                    self._rain.burst(15)
-                    self._last_burst_earned = earned
-
-        elif state == WorkState.OFF_WORK:
-            work_start = sess.work_start or now
-            lunch_dur  = 0
-            if sess.lunch_start and sess.lunch_end:
-                lunch_dur = (sess.lunch_end - sess.lunch_start).total_seconds()
-            work_end = sess.work_end or now
-            elapsed  = max(0, (work_end - work_start).total_seconds() - lunch_dur)
-            work_day_secs = 8 * 3600
-            pct    = min(elapsed / work_day_secs, 1.0)
-            earned = daily * pct
-            if elapsed > work_day_secs:
-                earned = daily + (daily / work_day_secs) * (elapsed - work_day_secs) * 1.5
-
-            self.lbl_status_emoji.setText("🎉")
-            self.lbl_status_text.setText("下班了！辛苦了！")
-            self._card_countdown[1].setText("DONE ✓")
-            self._card_countdown[1].setStyleSheet(f"color:{NC['green']};font-size:16px;font-weight:bold;")
+        elif now <= end_dt:
+            # 上班时间内：正常工作
+            elapsed = (now - start_dt).total_seconds()
+            pct     = min(elapsed / work_day_secs, 1.0)
+            earned  = daily * pct
+            remain  = max(0, work_day_secs - elapsed)
+            rh, rr  = divmod(int(remain), 3600); rm, rs = divmod(rr, 60)
+            self._card_countdown[1].setText(f"{rh:02d}:{rm:02d}:{rs:02d}")
+            self._card_countdown[1].setStyleSheet(f"color:{NC['cyan']};font-size:16px;font-weight:bold;")
+            self.lbl_status_emoji.setText("💼")
+            self.lbl_status_text.setText("打工中")
             self._card_earned[1].setText(f"¥ {earned:,.2f}")
-            pct = min(pct, 1.0)
-            self._rain.set_intensity(0)
+            per_second = daily / work_day_secs
+            self._rain.set_intensity(min(0.3 + per_second / 0.5, 1.2))
+            milestone = 10.0
+            if int(earned / milestone) > int(self._last_burst_earned / milestone):
+                self._rain.burst(15)
+                self._last_burst_earned = earned
+
+        else:
+            # 超过下班时间：加班
+            overtime_secs = (now - end_dt).total_seconds()
+            earned  = daily + (daily / work_day_secs) * overtime_secs * 1.5
+            pct     = 1.0
+            ot      = int(overtime_secs)
+            oh, or_ = divmod(ot, 3600); om, os_ = divmod(or_, 60)
+            self._card_countdown[1].setText(f"+{oh:02d}:{om:02d}:{os_:02d}")
+            self._card_countdown[1].setStyleSheet(f"color:{NC['purple']};font-size:16px;font-weight:bold;")
+            self.lbl_status_emoji.setText("⚡")
+            self.lbl_status_text.setText("加班中")
+            self._card_earned[1].setText(f"¥ {earned:,.2f}")
+            per_second = daily / work_day_secs
+            self._rain.set_intensity(min(0.3 + per_second / 0.5, 1.2))
+            milestone = 10.0
+            if int(earned / milestone) > int(self._last_burst_earned / milestone):
+                self._rain.burst(15)
+                self._last_burst_earned = earned
 
         self._ring.set_progress(pct)
         self._salary_bar.set_progress(pct)

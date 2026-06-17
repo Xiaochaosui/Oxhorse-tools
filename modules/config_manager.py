@@ -3,6 +3,15 @@ import os
 
 CONFIG_DIR  = os.path.join(os.path.dirname(__file__), '..', 'config')
 CONFIG_PATH = os.path.join(CONFIG_DIR, 'settings.json')
+LLM_PATH    = os.path.join(CONFIG_DIR, 'llm.json')
+
+_LLM_DEFAULTS = {
+    "api_key":    "",
+    "base_url":   "https://api.anthropic.com",
+    "model":      "claude-sonnet-4-6",
+    "max_tokens": 4096,
+    "timeout":    120,
+}
 
 _DEFAULTS = {
     'settings.json': {
@@ -22,7 +31,9 @@ _DEFAULTS = {
             "app_id": "",
             "app_secret": "",
             "bitable_app_token": "",
-            "bitable_table_id": ""
+            "bitable_table_id": "",
+            "weekly_report_doc_id": "",
+            "self_open_id": ""
         },
         "stock": {
             "watchlist": ["sh000001",
@@ -103,3 +114,21 @@ def set(key_path: str, value):
         d = d.setdefault(k, {})
     d[keys[-1]] = value
     save(cfg)
+
+
+def get_llm() -> dict:
+    """读取 llm.json，缺失字段用默认值补全；环境变量优先级最高。"""
+    if os.path.exists(LLM_PATH):
+        with open(LLM_PATH, 'r', encoding='utf-8') as f:
+            file_cfg = json.load(f)
+    else:
+        file_cfg = {}
+    cfg = {**_LLM_DEFAULTS, **file_cfg}
+    # 环境变量覆盖（优先级最高）
+    if v := os.environ.get('ANTHROPIC_AUTH_TOKEN') or os.environ.get('ANTHROPIC_API_KEY'):
+        cfg['api_key'] = v
+    if v := os.environ.get('ANTHROPIC_BASE_URL'):
+        cfg['base_url'] = v
+    if v := os.environ.get('ANTHROPIC_MODEL'):
+        cfg['model'] = v
+    return cfg
