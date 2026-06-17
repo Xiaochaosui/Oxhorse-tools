@@ -570,16 +570,68 @@ def _extract_conclusion(analysis: str) -> str:
 
 def _md_to_html(md: str) -> str:
     import html as h
+
+    def _fmt(c: str) -> str:
+        c = h.escape(c)
+        c = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', c)
+        c = re.sub(r'`(.+?)`', r'<code>\1</code>', c)
+        return c
+
+    def _parse_row(r: str) -> list[str]:
+        return [c.strip() for c in r.strip().strip('|').split('|')]
+
+    def _is_sep(r: str) -> bool:
+        return bool(re.match(r'^[\|\-\s:]+$', r.strip()))
+
     lines = md.split('\n')
     out = []
     in_code = False
-    for line in lines:
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
         if line.startswith('```'):
             in_code = not in_code
             out.append('<pre>' if in_code else '</pre>')
+            i += 1
             continue
+
         if in_code:
-            out.append(h.escape(line)); continue
+            out.append(h.escape(line))
+            i += 1
+            continue
+
+        # ── Markdown 表格 ───────────────────────────────────────────────────
+        s = line.strip()
+        if s.startswith('|') and s.endswith('|') and s.count('|') >= 2:
+            tbl = []
+            while i < len(lines):
+                ls = lines[i].strip()
+                if ls.startswith('|') and ls.endswith('|'):
+                    tbl.append(lines[i])
+                    i += 1
+                else:
+                    break
+            rows = [r for r in tbl if not _is_sep(r)]
+            if rows:
+                out.append('<table class="md-table">')
+                out.append(
+                    '<thead><tr>'
+                    + ''.join(f'<th>{_fmt(c)}</th>' for c in _parse_row(rows[0]))
+                    + '</tr></thead>'
+                )
+                out.append('<tbody>')
+                for row in rows[1:]:
+                    out.append(
+                        '<tr>'
+                        + ''.join(f'<td>{_fmt(c)}</td>' for c in _parse_row(row))
+                        + '</tr>'
+                    )
+                out.append('</tbody></table>')
+            continue
+
+        # ── 普通行 ──────────────────────────────────────────────────────────
         line = h.escape(line)
         if line.startswith('### '):
             out.append(f'<h3>{line[4:]}</h3>')
@@ -596,6 +648,8 @@ def _md_to_html(md: str) -> str:
                 out.append('<p style="margin:4px 0"></p>')
             else:
                 out.append(f'<p>{line}</p>')
+        i += 1
+
     return '\n'.join(out)
 
 
@@ -647,6 +701,12 @@ code {{ background:#0a1a2a; border:1px solid #1a3a5c; border-radius:3px;
         padding:1px 5px; font-family:monospace; font-size:12px; color:#00e676; }}
 pre {{ background:#0a1a2a; border:1px solid #1a3a5c; border-radius:6px;
        padding:12px; font-family:monospace; font-size:12px; overflow-x:auto; color:#aed6f1; }}
+.md-table {{ border-collapse:collapse; width:100%; margin:10px 0; font-size:13px; }}
+.md-table th {{ background:#0a1e38; color:#4fc3f7; font-weight:600; text-align:left;
+                padding:7px 10px; border:1px solid #1a3a5c; white-space:nowrap; }}
+.md-table td {{ padding:6px 10px; border:1px solid #0d2540; color:#b8cce0; vertical-align:top; }}
+.md-table tr:nth-child(even) td {{ background:#060f1c; }}
+.md-table tr:hover td {{ background:#0e1f35; }}
 .ft {{ margin-top:24px; font-size:11px; color:#2a4a6a; text-align:center; font-family:monospace; }}
 </style>
 </head>
