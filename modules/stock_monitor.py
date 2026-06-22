@@ -2,33 +2,24 @@
 A股盯盘模块 - 新浪财经实时行情 + 涨跌幅提醒
 """
 import threading
-import subprocess
 import requests
 import re
+import logging
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QTableWidget, QTableWidgetItem, QPushButton, QLineEdit,
-    QHeaderView, QGroupBox, QDoubleSpinBox, QMenu
+    QHeaderView, QGroupBox, QDoubleSpinBox, QMenu, QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
 from PyQt6.QtGui import QColor, QAction
 from modules.theme import NEON_COLORS as NC
 import modules.config_manager as cfg
 from modules.daily_report import ReportPanel
+from cross_platform_utils import send_notification as _notify
 
 SINA_URL = "http://hq.sinajs.cn/list={codes}"
 SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
-
-
-def _notify(title: str, body: str):
-    try:
-        subprocess.Popen(
-            ['notify-send', '-i', 'dialog-information', '-t', '8000', title, body],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        pass
 
 
 def _parse_sina(code: str, raw: str) -> dict | None:
@@ -66,6 +57,20 @@ def _parse_sina(code: str, raw: str) -> dict | None:
         return None
 
 
+_log = logging.getLogger(__name__)
+
+
+class _ReorderTable(QTableWidget):
+    """支持拖拽排序的 QTableWidget，drop 后通过 _on_reorder 回调通知"""
+
+    def dropEvent(self, event):
+        src_row = self.currentRow()
+        super().dropEvent(event)
+        # 计算 drop 后的新行号（通过行的 item 反查）
+        if hasattr(self, '_on_reorder') and src_row >= 0:
+            self._on_reorder()
+
+
 class StockFetcher(QObject):
     data_ready = pyqtSignal(list)
 
@@ -77,13 +82,22 @@ class StockFetcher(QObject):
             self.data_ready.emit([]); return
         try:
             url  = SINA_URL.format(codes=','.join(codes))
-            resp = requests.get(url, headers=SINA_HEADERS, timeout=5)
+            resp = requests.get(url, headers=SINA_HEADERS, timeout=10)
             resp.encoding = 'gbk'
             lines   = resp.text.strip().split('\n')
-            results = [item for line, code in zip(lines, codes)
-                       if (item := _parse_sina(code, line))]
+            results = []
+            for line, code in zip(lines, codes):
+                item = _parse_sina(code, line)
+                if item:
+                    results.append(item)
+                else:
+                    _log.warning("Failed to parse Sina data for %s", code)
             self.data_ready.emit(results)
-        except Exception:
+        except requests.exceptions.Timeout:
+            _log.warning("Sina API timeout (codes=%d)", len(codes))
+            self.data_ready.emit([])
+        except requests.exceptions.RequestException as e:
+            _log.warning("Sina API request failed: %s", e)
             self.data_ready.emit([])
 
 
@@ -91,13 +105,10 @@ def _classify_code(code: str) -> str:
     """将代码归类为 index / etf / stock"""
     c = code.lower()
     num = c[2:] if c[:2] in ('sh', 'sz', 'bj') else c
-    # 指数：sh000xxx / sz399xxx / sz0xxxxx(宽基)
+    # 指数：sh000xxx / sz399xxx
     if c.startswith('sh0') or c.startswith('sz3') or c.startswith('sh000'):
         return 'index'
-    # ETF / 基金：sh5xxxxx / sz1xxxxx / sz159xxx
-    if (c.startswith('sh5') or c.startswith('sh6') and len(num) == 6 and num.startswith('5')
-            or c.startswith('sz1') or c.startswith('sz159')):
-        return 'etf'
+    # ETF / 基金：sh5xxxxx / sz1xxxxx（含 sz159xxx）
     if c.startswith('sh5') or c.startswith('sz1'):
         return 'etf'
     return 'stock'
@@ -148,14 +159,14 @@ class StockWidget(QWidget):
         h_layout.setSpacing(8)
 
         shell_label = QLabel("❯ python3 data_pipeline.py --monitor --live")
-        shell_label.setStyleSheet(f"color:{NC['dim']};font-size:11px;font-family:monospace;")
+        shell_label.setStyleSheet(f"color:{NC['dim']};font-size:11px;font-family:'Consolas','Courier New',monospace;")
 
         self.lbl_last_update = QLabel("--:--:--")
-        self.lbl_last_update.setStyleSheet(f"color:{NC['dim']};font-size:10px;font-family:monospace;")
+        self.lbl_last_update.setStyleSheet(f"color:{NC['dim']};font-size:10px;font-family:'Consolas','Courier New',monospace;")
         self.lbl_last_update.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.lbl_market_status = QLabel("● LIVE")
-        self.lbl_market_status.setStyleSheet(f"color:{NC['green']};font-size:10px;font-family:monospace;")
+        self.lbl_market_status.setStyleSheet(f"color:{NC['green']};font-size:10px;font-family:'Consolas','Courier New',monospace;")
         self.lbl_market_status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         h_layout.addWidget(shell_label, 4)
@@ -184,24 +195,32 @@ class StockWidget(QWidget):
         root.addWidget(tab_bar)
 
         # ── 行情表格 ──
-        self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["代码", "名称", "最新价", "涨跌幅", "涨跌额", "成交量(亿)"])
+        self.table = _ReorderTable()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["⇅", "代码", "名称", "最新价", "涨跌幅", "涨跌额", "成交量(亿)"])
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 80)
-        self.table.setColumnWidth(2, 75)
-        self.table.setColumnWidth(3, 75)
-        self.table.setColumnWidth(4, 65)
-        self.table.setColumnWidth(5, 80)
+        # 拖拽排序
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.table.setDragDropOverwriteMode(False)
+        self.table.setDropIndicatorShown(True)
+        # 列宽：handle 固定 28px，名称自动拉伸
+        self.table.setColumnWidth(0, 28)   # ⇅ handle
+        self.table.setColumnWidth(1, 80)   # 代码
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # 名称
+        self.table.setColumnWidth(3, 75)   # 最新价
+        self.table.setColumnWidth(4, 75)   # 涨跌幅
+        self.table.setColumnWidth(5, 65)   # 涨跌额
+        self.table.setColumnWidth(6, 80)   # 成交量
         self.table.setStyleSheet(f"""
             QTableWidget {{
                 background:#050d18; alternate-background-color:#07111f;
                 gridline-color:#0f1e30; border:1px solid {NC['border']};
-                font-family:monospace; font-size:12px;
+                font-family:'Consolas','Courier New',monospace; font-size:12px;
             }}
             QTableWidget::item {{ padding:5px 6px; color:{NC['text']}; }}
             QTableWidget::item:selected {{ background:#1a3a5c; }}
@@ -213,6 +232,7 @@ class StockWidget(QWidget):
         """)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table._on_reorder = self._on_table_reorder
         root.addWidget(self.table)
 
         # ── 涨跌提醒设置 ──
@@ -263,7 +283,7 @@ class StockWidget(QWidget):
             QLineEdit {{
                 background:#050d18; border:1px solid {NC['border']};
                 border-radius:4px; color:{NC['text']};
-                padding:5px 8px; font-family:monospace; font-size:12px;
+                padding:5px 8px; font-family:'Consolas','Courier New',monospace; font-size:12px;
             }}
             QLineEdit:focus {{ border-color:{NC['cyan']}; }}
         """)
@@ -311,8 +331,8 @@ class StockWidget(QWidget):
         trading = self._is_trading_time()
         self.lbl_market_status.setText("● LIVE" if trading else "○ 休市")
         self.lbl_market_status.setStyleSheet(
-            f"color:{NC['green']};font-size:10px;font-family:monospace;" if trading
-            else f"color:{NC['dim']};font-size:10px;font-family:monospace;"
+            f"color:{NC['green']};font-size:10px;font-family:'Consolas','Courier New',monospace;" if trading
+            else f"color:{NC['dim']};font-size:10px;font-family:'Consolas','Courier New',monospace;"
         )
         codes = cfg.get('stock.watchlist', [])
         if codes:
@@ -334,7 +354,7 @@ class StockWidget(QWidget):
                     color:{NC['cyan'] if active else NC['dim']};
                     border:1px solid {NC['cyan'] if active else NC['border']};
                     border-radius:4px; font-size:10px; padding:2px 8px;
-                    font-family:monospace; letter-spacing:1px;
+                    font-family:'Consolas','Courier New',monospace; letter-spacing:1px;
                 }}
                 QPushButton:hover {{ background:#0f2a3a; border-color:{NC['cyan']}; color:{NC['cyan']}; }}
             """)
@@ -364,6 +384,13 @@ class StockWidget(QWidget):
         rows = self._filtered_data(data)
         self.table.setRowCount(len(rows))
         for ri, item in enumerate(rows):
+            # 拖拽手柄列
+            handle = QTableWidgetItem("⋮⋮")
+            handle.setForeground(QColor(NC['dim']))
+            handle.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            handle.setToolTip("拖拽可调整顺序")
+            self.table.setItem(ri, 0, handle)
+
             chg_pct = item['change_pct']
             chg     = item['change']
             sign    = '+' if chg_pct > 0 else ''
@@ -380,18 +407,19 @@ class StockWidget(QWidget):
                 cell = QTableWidgetItem(text)
                 cell.setForeground(QColor(fg))
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(ri, col, cell)
+                self.table.setItem(ri, col + 1, cell)  # col 0 is handle
 
     def _show_context_menu(self, pos: QPoint):
         row = self.table.rowAt(pos.y())
         if row < 0:
             return
-        code_item = self.table.item(row, 0)
-        name_item = self.table.item(row, 1)
+        code_item = self.table.item(row, 1)   # col 1 is 代码
+        name_item = self.table.item(row, 2)   # col 2 is 名称
         if not code_item:
             return
         code = code_item.text()
         name = name_item.text() if name_item else code
+        total_rows = self.table.rowCount()
         custom = set(cfg.get('stock.custom_group', []))
         in_custom = code in custom
 
@@ -410,6 +438,13 @@ class StockWidget(QWidget):
         lbl.setEnabled(False)
         menu.addSeparator()
 
+        # 排序操作
+        act_top    = menu.addAction("⤒  移至顶部")
+        act_up     = menu.addAction("↑  上移")
+        act_down   = menu.addAction("↓  下移")
+        act_bottom = menu.addAction("⤓  移至底部")
+        menu.addSeparator()
+
         if in_custom:
             act_toggle = menu.addAction("☆  从「自选」分组移除")
         else:
@@ -419,7 +454,15 @@ class StockWidget(QWidget):
         act_del = menu.addAction("✕  从自选股删除")
 
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if action == act_toggle:
+        if action == act_top:
+            self._move_row(row, 0 - row)
+        elif action == act_up:
+            self._move_row(row, -1)
+        elif action == act_down:
+            self._move_row(row, 1)
+        elif action == act_bottom:
+            self._move_row(row, total_rows - 1 - row)
+        elif action == act_toggle:
             self._toggle_custom(code, in_custom)
         elif action == act_del:
             self._remove_by_code(code)
@@ -435,6 +478,68 @@ class StockWidget(QWidget):
         self._update_tab_counts(self._last_data)
         if self._active_tab == 'custom':
             self._render_table(self._last_data)
+
+    # ── 拖拽排序 ──────────────────────────────────────────────────────────
+
+    def _on_table_reorder(self):
+        """拖拽后回调：将表格当前行顺序同步回 watchlist 配置"""
+        new_order = []
+        for row in range(self.table.rowCount()):
+            code_item = self.table.item(row, 1)  # col 1 = 代码
+            if code_item:
+                new_order.append(code_item.text())
+        if not new_order:
+            return
+
+        # 获取原 watchlist 中未在当前视图显示的代码，保持顺序追加到末尾
+        displayed = set(new_order)
+        codes = cfg.get('stock.watchlist', [])
+        names = cfg.get('stock.watchlist_names', [])
+        # 构建 code->name 映射
+        name_map = dict(zip(codes, names))
+        # 重新排列 watchlist
+        new_codes = new_order + [c for c in codes if c not in displayed]
+        new_names = [name_map.get(c, c) for c in new_codes]
+        cfg.set('stock.watchlist', new_codes)
+        cfg.set('stock.watchlist_names', new_names)
+
+        # 同步 _last_data 顺序
+        data_map = {d['code']: d for d in self._last_data}
+        self._last_data = [data_map[c] for c in new_order if c in data_map]
+        # 不需要重新 fetch，只重绘
+        self._update_tab_counts(self._last_data)
+        self._render_table(self._last_data)
+
+    def _move_row(self, row: int, delta: int):
+        """将 row 移动 delta 行（负数=上移，正数=下移）"""
+        if delta == 0:
+            return
+        target = max(0, min(self.table.rowCount() - 1, row + delta))
+        if target == row:
+            return
+        # 构建新的顺序列表
+        codes = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 1)
+            if item:
+                codes.append(item.text())
+        # 移动元素
+        code = codes.pop(row)
+        codes.insert(target, code)
+        # 构建新的 data 列表
+        data_map = {d['code']: d for d in self._last_data}
+        new_data = [data_map[c] for c in codes if c in data_map]
+        # 更新 watchlist
+        all_codes = cfg.get('stock.watchlist', [])
+        name_map = dict(zip(all_codes, cfg.get('stock.watchlist_names', [])))
+        other = [c for c in all_codes if c not in codes]
+        new_all = codes + other
+        cfg.set('stock.watchlist', new_all)
+        cfg.set('stock.watchlist_names', [name_map.get(c, c) for c in new_all])
+        # 刷新
+        self._last_data = new_data
+        self._update_tab_counts(self._last_data)
+        self._render_table(self._last_data)
 
     def _on_data(self, data: list):
         self.lbl_last_update.setText(datetime.now().strftime('%H:%M:%S'))
@@ -492,7 +597,7 @@ class StockWidget(QWidget):
         row = self.table.currentRow()
         if row < 0:
             return
-        code_item = self.table.item(row, 0)
+        code_item = self.table.item(row, 1)  # col 1 = 代码
         if not code_item:
             return
         self._remove_by_code(code_item.text())

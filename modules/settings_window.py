@@ -4,7 +4,8 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QTabWidget,
     QGroupBox, QGridLayout, QPushButton, QLineEdit, QTimeEdit,
-    QDoubleSpinBox, QSpinBox, QComboBox, QScrollArea, QSizePolicy
+    QDoubleSpinBox, QSpinBox, QComboBox, QScrollArea, QSizePolicy,
+    QCheckBox
 )
 from PyQt6.QtCore import Qt, QTime, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen
@@ -291,29 +292,44 @@ class SettingsWindow(QWidget):
 
         info = QLabel(
             "每个窗口支持拖拽边缘调整大小，退出时自动记忆位置和尺寸。\n"
-            "下方可手动指定各窗口的默认宽/高，点「重置位置」将所有窗口移回屏幕右下角。"
+            "下方可手动指定各窗口的默认宽/高，以及是否在托盘中显示该窗口。"
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color:{NC['dim']};font-size:11px;line-height:160%;padding:4px 0;")
         lay.addWidget(info)
 
         from main import WINDOWS_CONFIG
-        self._win_size_inputs = {}
+        self._win_size_inputs: dict = {}
+        self._win_visible_cbs: dict = {}
         for wc in WINDOWS_CONFIG:
             grp = QGroupBox(f"{wc['emoji']}  {wc['title']}")
             grp.setStyleSheet(_GRP)
             g = QGridLayout(grp)
             g.setSpacing(10); g.setContentsMargins(14,18,14,14)
 
+            # 可见性开关
+            cb_visible = QCheckBox("在托盘中显示此窗口")
+            cb_visible.setChecked(wc.get('visible', False))
+            cb_visible.setStyleSheet(f"""
+                QCheckBox {{ color:{NC['text']}; font-size:12px; spacing:8px; }}
+                QCheckBox::indicator {{ width:16px; height:16px;
+                    border:1px solid {NC['border']}; border-radius:3px;
+                    background:#0d1a2e; }}
+                QCheckBox::indicator:checked {{
+                    background-color:{NC['cyan']}; border-color:{NC['cyan']}; }}
+            """)
+            g.addWidget(cb_visible, 0, 0, 1, 4)
+
             sb_w = QSpinBox(); sb_w.setRange(320, 1600); sb_w.setSuffix(" px"); sb_w.setValue(wc['width'])
             sb_h = QSpinBox(); sb_h.setRange(300, 1200); sb_h.setSuffix(" px"); sb_h.setValue(wc['height'])
-            g.addWidget(_lbl("宽度"), 0,0); g.addWidget(sb_w, 0,1)
-            g.addWidget(_lbl("高度"), 0,2); g.addWidget(sb_h, 0,3)
+            g.addWidget(_lbl("宽度"), 1,0); g.addWidget(sb_w, 1,1)
+            g.addWidget(_lbl("高度"), 1,2); g.addWidget(sb_h, 1,3)
             self._win_size_inputs[wc['id']] = (sb_w, sb_h)
+            self._win_visible_cbs[wc['id']] = cb_visible
             lay.addWidget(grp)
 
         row = QHBoxLayout()
-        btn_apply  = self._save_btn("应用窗口尺寸", self._apply_window_sizes)
+        btn_apply  = self._save_btn("应用窗口设置", self._apply_window_sizes)
         btn_reset  = QPushButton("↺  重置所有窗口位置")
         btn_reset.setStyleSheet(f"""
             QPushButton {{
@@ -401,7 +417,7 @@ class SettingsWindow(QWidget):
         self.input_apptoken.setText(f.get('bitable_app_token', ''))
         self.input_tableid.setText(f.get('bitable_table_id', ''))
 
-        # 窗口尺寸从已保存的配置读取
+        # 窗口尺寸 / 可见性从已保存的配置读取
         from main import _load_positions, WINDOWS_CONFIG
         saved = _load_positions()
         for wc in WINDOWS_CONFIG:
@@ -411,6 +427,12 @@ class SettingsWindow(QWidget):
                 if wid in saved and 'w' in saved[wid]:
                     sw.setValue(saved[wid]['w'])
                     sh.setValue(saved[wid]['h'])
+            if wid in self._win_visible_cbs:
+                cb = self._win_visible_cbs[wid]
+                if wid in saved and 'visible' in saved[wid]:
+                    cb.setChecked(saved[wid]['visible'])
+                else:
+                    cb.setChecked(wc.get('visible', False))
 
     # ── 保存 ────────────────────────────────────────────────────────────────
 
@@ -463,8 +485,12 @@ class SettingsWindow(QWidget):
                     positions[wid] = {}
                 positions[wid]['w'] = sb_w.value()
                 positions[wid]['h'] = sb_h.value()
+            # 保存窗口可见性
+            if wid in self._win_visible_cbs:
+                positions.setdefault(wid, {})
+                positions[wid]['visible'] = self._win_visible_cbs[wid].isChecked()
         _save_positions(positions)
-        self.settings_saved.emit()  # main.py 里监听并 resize 窗口
+        self.settings_saved.emit()  # main.py 里监听并 resize / 显示/隐藏窗口
         self._flash_saved()
 
     def _reset_positions(self):

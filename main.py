@@ -6,11 +6,27 @@ Work Assistant - 上班族效率小工具
 import sys
 import os
 import json
+import platform as _platform
 
 # 必须在 QApplication 创建之前设置，让 Qt 通过 XIM 协议连接 fcitx，
 # 不依赖任何 Qt 输入法插件（解决 miniconda PyQt6 与系统 fcitx 插件 ABI 不兼容问题）
-os.environ.setdefault('QT_IM_MODULE', 'fcitx')
-os.environ.setdefault('XMODIFIERS', '@im=fcitx')
+# 仅 Linux / X11 环境需要，Windows 下跳过
+if _platform.system() == 'Linux':
+    os.environ.setdefault('QT_IM_MODULE', 'fcitx')
+    os.environ.setdefault('XMODIFIERS', '@im=fcitx')
+
+# Windows: 抑制 DirectWrite 对 Fixedsys 等位图字体的无害警告
+# Fixedsys 是系统注册的位图字体，不兼容 DirectWrite，Qt 枚举字体时会触发
+# CreateFontFaceFromHDC() failed 警告，不影响任何功能，仅关闭日志输出
+if _platform.system() == 'Windows':
+    os.environ.setdefault('QT_LOGGING_RULES', 'qt.qpa.fonts=false')
+    # Windows Store 版 Python 不会自动搜索包内 DLL 目录，
+    # 需要在 import PyQt6 之前手动注册 Qt6/bin 到 DLL 搜索路径
+    for p in sys.path:
+        qt6_bin = os.path.join(p, 'PyQt6', 'Qt6', 'bin')
+        if os.path.isdir(qt6_bin):
+            os.add_dll_directory(qt6_bin)
+            break
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -19,8 +35,15 @@ from modules.config_manager import ensure_defaults
 ensure_defaults()
 
 WIN_POS_FILE = os.path.join(os.path.dirname(__file__), 'config', 'window_positions.json')
-AUTOSTART_PATH = os.path.expanduser('~/.config/autostart/work-assistant.desktop')
 SCRIPT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'main.py'))
+
+# Linux 专用：XDG 自启动 desktop 文件路径
+if _platform.system() == 'Linux':
+    AUTOSTART_PATH = os.path.expanduser('~/.config/autostart/work-assistant.desktop')
+elif _platform.system() == 'Windows':
+    AUTOSTART_PATH = None  # Windows 使用注册表，无需文件路径
+else:
+    AUTOSTART_PATH = None
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QMenu,
@@ -150,11 +173,33 @@ def _save_positions(positions: dict):
         pass
 
 
+_WIN_REG_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
+_WIN_REG_NAME = 'WorkAssistant'
+
+
+def _is_autostart_enabled() -> bool:
+    """检测当前系统是否已开启开机自启"""
+    if _platform.system() == 'Linux':
+        return os.path.exists(AUTOSTART_PATH)
+    elif _platform.system() == 'Windows':
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_REG_KEY) as key:
+                winreg.QueryValueEx(key, _WIN_REG_NAME)
+                return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+    return False
+
+
 def _setup_autostart(enable: bool):
-    """创建或删除 XDG 自启动 .desktop 文件"""
-    if enable:
-        os.makedirs(os.path.dirname(AUTOSTART_PATH), exist_ok=True)
-        content = f"""[Desktop Entry]
+    """创建或删除开机自启条目（Linux: .desktop 文件 / Windows: 注册表 Run 键）"""
+    if _platform.system() == 'Linux':
+        if enable:
+            os.makedirs(os.path.dirname(AUTOSTART_PATH), exist_ok=True)
+            content = f"""[Desktop Entry]
 Type=Application
 Name=Work Assistant
 Exec=python3 {SCRIPT_PATH}
@@ -163,12 +208,29 @@ NoDisplay=false
 X-GNOME-Autostart-enabled=true
 Comment=Work Assistant - 上班族效率小工具
 """
-        with open(AUTOSTART_PATH, 'w') as f:
-            f.write(content)
-    else:
+            with open(AUTOSTART_PATH, 'w') as f:
+                f.write(content)
+        else:
+            try:
+                os.remove(AUTOSTART_PATH)
+            except FileNotFoundError:
+                pass
+    elif _platform.system() == 'Windows':
         try:
-            os.remove(AUTOSTART_PATH)
-        except FileNotFoundError:
+            import winreg
+            if enable:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_REG_KEY,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, _WIN_REG_NAME, 0, winreg.REG_SZ,
+                                      f'"{sys.executable}" "{SCRIPT_PATH}"')
+            else:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_REG_KEY,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                    try:
+                        winreg.DeleteValue(key, _WIN_REG_NAME)
+                    except FileNotFoundError:
+                        pass
+        except Exception:
             pass
 
 
@@ -436,7 +498,7 @@ class App:
         self._settings_win._load_all()  # 每次打开刷新最新值
 
     def _on_settings_saved(self):
-        """设置保存后：刷新各窗口尺寸（如果有变化）、重置窗口位置（如触发）"""
+        """设置保存后：刷新各窗口尺寸/可见性/位置"""
         saved = _load_positions()
         screen = QApplication.primaryScreen().geometry()
         sw_s, sh_s = screen.width(), screen.height()
@@ -454,6 +516,12 @@ class App:
                 x = max(0, min(entry['x'], sw_s - win.width()))
                 y = max(0, min(entry['y'], sh_s - win.height()))
                 win.move(x, y)
+            # 应用可见性：关闭的窗口立即隐藏，也更新托盘菜单勾选状态
+            if 'visible' in entry:
+                if not entry['visible']:
+                    win.hide()
+                if hasattr(win, '_tray_action'):
+                    win._tray_action.setChecked(win.isVisible())
 
     def show_default(self):
         """首次启动按 WINDOWS_CONFIG 的 visible 决定显示哪些窗口；
@@ -468,9 +536,26 @@ class App:
             elif wc.get('visible', False):
                 win.show()
 
+    def _get_enabled_window_ids(self) -> set:
+        """读取已保存的配置，返回用户启用的窗口 id 集合。
+        如果某个窗口尚无保存记录，回退到 WINDOWS_CONFIG 的 visible 默认值。"""
+        saved = _load_positions()
+        enabled = set()
+        for wc in WINDOWS_CONFIG:
+            wid = wc['id']
+            if wid in saved and 'visible' in saved[wid]:
+                if saved[wid]['visible']:
+                    enabled.add(wid)
+            elif wc.get('visible', False):
+                enabled.add(wid)
+        return enabled
+
     def show_all(self):
-        for win in self._windows.values():
-            win.show()
+        """只显示用户在设置中启用的窗口"""
+        enabled = self._get_enabled_window_ids()
+        for wid, win in self._windows.items():
+            if wid in enabled:
+                win.show()
 
     def hide_all(self):
         for win in self._windows.values():
@@ -540,8 +625,11 @@ class App:
 
         act_autostart = QAction("⚡  开机自启", menu)
         act_autostart.setCheckable(True)
-        act_autostart.setChecked(os.path.exists(AUTOSTART_PATH))
-        act_autostart.triggered.connect(lambda checked: _setup_autostart(checked))
+        act_autostart.setChecked(_is_autostart_enabled())
+        act_autostart.triggered.connect(lambda checked: (
+            _setup_autostart(checked),
+            act_autostart.setChecked(_is_autostart_enabled()),
+        ))
         menu.addAction(act_autostart)
         menu.addSeparator()
 
