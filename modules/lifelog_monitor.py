@@ -1,10 +1,10 @@
 """
 LifeLog 后台监控
-- WindowMonitor  : 后台线程只用 xdotool 探测窗口切换（纯 subprocess，线程安全）
+- WindowMonitor  : 后台线程探测窗口切换（跨平台，纯 subprocess / ctypes，线程安全）
                    截图通过信号派发回主线程执行（Qt GUI 操作必须在主线程）
 - ClipboardMonitor: 纯主线程 QObject，连接 QClipboard.dataChanged 信号
 """
-import re, hashlib, subprocess
+import re, hashlib
 from datetime import datetime
 
 from PyQt6.QtCore import QThread, QObject, pyqtSignal, QTimer
@@ -12,20 +12,7 @@ from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QApplication
 
 from modules.lifelog_db import SHOTS_DIR, CLIPS_DIR
-
-
-# ── 系统工具函数 ─────────────────────────────────────────────────────────
-
-def get_active_window() -> tuple[str, str]:
-    """返回 (app_name, window_title)，只用 subprocess，线程安全"""
-    try:
-        wid   = subprocess.check_output(["xdotool", "getactivewindow"],     stderr=subprocess.DEVNULL).decode().strip()
-        title = subprocess.check_output(["xdotool", "getwindowname",  wid], stderr=subprocess.DEVNULL).decode().strip()
-        pid   = subprocess.check_output(["xdotool", "getwindowpid",   wid], stderr=subprocess.DEVNULL).decode().strip()
-        app   = subprocess.check_output(["ps", "-p", pid, "-o", "comm="],   stderr=subprocess.DEVNULL).decode().strip()
-        return app, title
-    except Exception:
-        return "", ""
+from cross_platform_utils import get_active_window
 
 
 def take_screenshot(app_name: str) -> str:
@@ -46,10 +33,10 @@ def take_screenshot(app_name: str) -> str:
         return ""
 
 
-# ── 窗口监控：后台线程只跑 xdotool ───────────────────────────────────────
+# ── 窗口监控：后台线程轮询活动窗口 ──────────────────────────────────────
 
 class _WindowPoller(QThread):
-    """只负责轮询 xdotool，检测到标题变化时 emit 信号（不碰 Qt GUI）"""
+    """轮询活动窗口（跨平台），检测到标题变化时 emit 信号（不碰 Qt GUI）"""
     title_changed = pyqtSignal(str, str)   # app, title
 
     def __init__(self):

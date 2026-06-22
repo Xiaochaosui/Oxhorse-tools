@@ -201,6 +201,10 @@ QToolTip {
 }
 """
 
+# 跨平台等宽字体栈：Windows 回退到 Consolas / Courier New
+# 避免 Qt 将 monospace 解析为 Fixedsys（位图字体，不兼容 DirectWrite）
+MONO_FONT_STACK = "'JetBrains Mono', 'Consolas', 'Courier New', monospace"
+
 NEON_COLORS = {
     "cyan": "#4fc3f7",
     "blue": "#1565c0",

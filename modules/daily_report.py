@@ -643,7 +643,8 @@ def _md_to_html(md: str) -> str:
             line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
             line = re.sub(r'`(.+?)`', r'<code>\1</code>', line)
             if re.match(r'^- |^\d+\. ', line):
-                out.append(f'<li>{re.sub(r"^- |^\d+\. ", "", line)}</li>')
+                cleaned = re.sub(r"^- |^\d+\. ", "", line)
+                out.append(f'<li>{cleaned}</li>')
             elif line.strip() == '':
                 out.append('<p style="margin:4px 0"></p>')
             else:
@@ -682,13 +683,13 @@ body {{ background:#050d18; color:#c8d8e8; font-family:'PingFang SC','Microsoft 
         font-size:14px; line-height:1.75; padding:28px 32px; max-width:900px; margin:0 auto; }}
 .hd {{ border-bottom:1px solid #1a3a5c; padding-bottom:16px; margin-bottom:20px; }}
 .hd h1 {{ font-size:22px; color:#4fc3f7; letter-spacing:2px; }}
-.hd .meta {{ font-size:11px; color:#3a5a7a; margin-top:5px; font-family:monospace; }}
+.hd .meta {{ font-size:11px; color:#3a5a7a; margin-top:5px; font-family:'Consolas','Courier New',monospace; }}
 .chips {{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:24px; }}
 .chip {{ background:#07111f; border:1px solid #1a3a5c; border-radius:8px;
          padding:8px 14px; display:flex; flex-direction:column; align-items:center; min-width:88px; }}
 .cn {{ font-size:10px; color:#5a8aaa; margin-bottom:2px; }}
-.cp {{ font-size:15px; color:#e8f4ff; font-weight:bold; font-family:monospace; }}
-.cc {{ font-size:12px; font-weight:bold; font-family:monospace; }}
+.cp {{ font-size:15px; color:#e8f4ff; font-weight:bold; font-family:'Consolas','Courier New',monospace; }}
+.cc {{ font-size:12px; font-weight:bold; font-family:'Consolas','Courier New',monospace; }}
 .body {{ background:#07111f; border:1px solid #1a3a5c; border-radius:10px; padding:24px 28px; }}
 h1 {{ font-size:19px; color:#4fc3f7; margin:20px 0 8px; }}
 h2 {{ font-size:16px; color:#4fc3f7; margin:20px 0 8px;
@@ -698,16 +699,16 @@ p {{ margin:5px 0; color:#b8cce0; }}
 li {{ margin:4px 0 4px 22px; color:#b8cce0; }}
 strong {{ color:#ffd740; }}
 code {{ background:#0a1a2a; border:1px solid #1a3a5c; border-radius:3px;
-        padding:1px 5px; font-family:monospace; font-size:12px; color:#00e676; }}
+        padding:1px 5px; font-family:'Consolas','Courier New',monospace; font-size:12px; color:#00e676; }}
 pre {{ background:#0a1a2a; border:1px solid #1a3a5c; border-radius:6px;
-       padding:12px; font-family:monospace; font-size:12px; overflow-x:auto; color:#aed6f1; }}
+       padding:12px; font-family:'Consolas','Courier New',monospace; font-size:12px; overflow-x:auto; color:#aed6f1; }}
 .md-table {{ border-collapse:collapse; width:100%; margin:10px 0; font-size:13px; }}
 .md-table th {{ background:#0a1e38; color:#4fc3f7; font-weight:600; text-align:left;
                 padding:7px 10px; border:1px solid #1a3a5c; white-space:nowrap; }}
 .md-table td {{ padding:6px 10px; border:1px solid #0d2540; color:#b8cce0; vertical-align:top; }}
 .md-table tr:nth-child(even) td {{ background:#060f1c; }}
 .md-table tr:hover td {{ background:#0e1f35; }}
-.ft {{ margin-top:24px; font-size:11px; color:#2a4a6a; text-align:center; font-family:monospace; }}
+.ft {{ margin-top:24px; font-size:11px; color:#2a4a6a; text-align:center; font-family:'Consolas','Courier New',monospace; }}
 </style>
 </head>
 <body>

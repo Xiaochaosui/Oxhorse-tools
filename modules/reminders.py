@@ -3,7 +3,6 @@
 """
 import math
 import random
-import subprocess
 from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton
@@ -21,16 +20,6 @@ from modules import reward_engine as re_engine
 from modules import reward_popup as rp
 from modules.punch_panel import PunchPanel
 from modules.work_session import WorkSession, WorkState
-
-
-def _notify(title: str, body: str):
-    try:
-        subprocess.Popen(
-            ['notify-send', '-i', 'dialog-information', '-t', '5000', title, body],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        pass
 
 
 # ── 水波涟漪（80×80）────────────────────────────────────────────────────────
