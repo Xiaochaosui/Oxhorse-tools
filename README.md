@@ -49,8 +49,8 @@ PyQt6 无边框多浮窗 + 系统托盘管理，Linux X11 原生运行。
 | notify-send | 系统包 | 桌面通知（通常已内置） |
 
 ```bash
-pip install PyQt6 requests
-sudo apt install xdotool libnotify-bin   # Linux
+pip install PyQt6 requests 
+sudo apt install xdotool libnotify-bin   # Linux, Windows系统不需要执行
 ```
 
 > `akshare` 已不再依赖，行情数据改用新浪财经 / 腾讯财经 / 东方财富接口直接拉取。

@@ -22,26 +22,30 @@ SINA_URL = "http://hq.sinajs.cn/list={codes}"
 SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
 
 
-def _parse_sina(code: str, raw: str) -> dict | None:
+def _parse_sina(code: str, raw: str) -> tuple:
+    """返回 (dict | None, reason: str)。reason 用于失败时日志诊断"""
     m = re.search(r'"([^"]*)"', raw)
     if not m:
-        return None
+        return None, "regex no match"
     parts = m.group(1).split(',')
+    # 未开市 / 代码不存在时新浪只返回 name 一个字段
+    if len(parts) < 2:
+        return None, f"empty data ({len(parts)} field): code may not exist on Sina"
     try:
         if code.startswith('sh0') or code.startswith('sz3') or code.startswith('sh000'):
             if len(parts) < 6:
-                return None
+                return None, f"index: only {len(parts)} fields"
             name = parts[0]
             prev_close = float(parts[2]) if parts[2] else 0
             price      = float(parts[3]) if parts[3] else 0
         else:
             if len(parts) < 10:
-                return None
+                return None, f"stock/etf: only {len(parts)} fields (need >=10)"
             name = parts[0]
             prev_close = float(parts[2]) if parts[2] else 0
             price      = float(parts[3]) if parts[3] else 0
         if prev_close == 0:
-            return None
+            return None, "prev_close is 0"
         change     = price - prev_close
         change_pct = change / prev_close * 100
         high   = float(parts[4]) if len(parts) > 4 and parts[4] else price
@@ -52,9 +56,9 @@ def _parse_sina(code: str, raw: str) -> dict | None:
             'price': price, 'prev_close': prev_close,
             'change': change, 'change_pct': change_pct,
             'high': high, 'low': low, 'volume': volume,
-        }
-    except (ValueError, IndexError):
-        return None
+        }, "ok"
+    except (ValueError, IndexError) as e:
+        return None, f"value error: {e}"
 
 
 _log = logging.getLogger(__name__)
@@ -73,6 +77,11 @@ class _ReorderTable(QTableWidget):
 
 class StockFetcher(QObject):
     data_ready = pyqtSignal(list)
+    _MAX_WARN_COUNT = 5  # 单个代码最多 warning 次数
+
+    def __init__(self):
+        super().__init__()
+        self._parse_failures: dict[str, int] = {}  # 代码 → 累计解析失败次数
 
     def fetch(self, codes: list):
         threading.Thread(target=self._run, args=(codes,), daemon=True).start()
@@ -87,11 +96,12 @@ class StockFetcher(QObject):
             lines   = resp.text.strip().split('\n')
             results = []
             for line, code in zip(lines, codes):
-                item = _parse_sina(code, line)
+                item, reason = _parse_sina(code, line)
                 if item:
                     results.append(item)
+                    self._parse_failures.pop(code, None)  # 成功后重置计数
                 else:
-                    _log.warning("Failed to parse Sina data for %s", code)
+                    self._log_parse_fail(code, reason)
             self.data_ready.emit(results)
         except requests.exceptions.Timeout:
             _log.warning("Sina API timeout (codes=%d)", len(codes))
@@ -99,6 +109,17 @@ class StockFetcher(QObject):
         except requests.exceptions.RequestException as e:
             _log.warning("Sina API request failed: %s", e)
             self.data_ready.emit([])
+
+    def _log_parse_fail(self, code: str, reason: str):
+        """解析失败限流：前 _MAX_WARN_COUNT 次打 WARNING，之后静默为 DEBUG"""
+        count = self._parse_failures.get(code, 0) + 1
+        self._parse_failures[code] = count
+        if count <= self._MAX_WARN_COUNT:
+            _log.warning("Sina parse fail [%s] (%d/%d): %s",
+                         code, count, self._MAX_WARN_COUNT, reason)
+        else:
+            _log.debug("Sina parse fail [%s] (x%d, suppressed): %s",
+                       code, count, reason)
 
 
 def _classify_code(code: str) -> str:
@@ -125,6 +146,9 @@ _TABS = [
 
 
 class StockWidget(QWidget):
+    _MAX_ADD_RETRIES = 5   # 新增股票最多重试次数
+    _MAX_WARN_COUNT  = 5   # 单个代码最多打印 warning 次数，之后静默
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._fetcher = StockFetcher()
@@ -133,6 +157,7 @@ class StockWidget(QWidget):
         self._alerted: set = set()
         self._last_data: list = []       # 缓存最新一批行情数据
         self._active_tab: str = 'all'    # 当前激活的分组
+        self._pending_codes: dict[str, int] = {}  # 新加代码 → 剩余重试次数
         self._build_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -547,6 +572,21 @@ class StockWidget(QWidget):
         self._update_tab_counts(data)
         self._render_table(data)
 
+        # ── 新加代码重试验证 ──
+        succeeded = {item['code'] for item in data}
+        expired = []
+        for code, remaining in list(self._pending_codes.items()):
+            if code in succeeded:
+                del self._pending_codes[code]   # 验证成功，移除追踪
+            else:
+                self._pending_codes[code] = remaining - 1
+                if self._pending_codes[code] <= 0:
+                    expired.append(code)
+
+        for code in expired:
+            del self._pending_codes[code]
+            self._remove_by_code(code, notify=True)
+
         alerted_this_batch = []
         for item in data:
             chg_pct = item['change_pct']
@@ -590,6 +630,8 @@ class StockWidget(QWidget):
             names.append(code)
             cfg.set('stock.watchlist', codes)
             cfg.set('stock.watchlist_names', names)
+            # 新代码加入重试队列，最多 _MAX_ADD_RETRIES 次验证
+            self._pending_codes[code] = self._MAX_ADD_RETRIES
         self.input_code.clear()
         self._refresh()
 
@@ -602,22 +644,29 @@ class StockWidget(QWidget):
             return
         self._remove_by_code(code_item.text())
 
-    def _remove_by_code(self, code: str):
+    def _remove_by_code(self, code: str, notify: bool = False):
         codes = cfg.get('stock.watchlist', [])
         names = cfg.get('stock.watchlist_names', [])
         if code in codes:
             idx = codes.index(code)
             codes.pop(idx)
             if idx < len(names):
-                names.pop(idx)
+                removed_name = names.pop(idx)
+            else:
+                removed_name = code
             cfg.set('stock.watchlist', codes)
             cfg.set('stock.watchlist_names', names)
+        else:
+            removed_name = code
         # 同步从自选分组移除
         custom = cfg.get('stock.custom_group', [])
         if code in custom:
             cfg.set('stock.custom_group', [c for c in custom if c != code])
         self._alerted.discard(code)
+        self._pending_codes.pop(code, None)  # 清理重试追踪
         self._last_data = [d for d in self._last_data if d['code'] != code]
         self._update_tab_counts(self._last_data)
         self._render_table(self._last_data)
         self._refresh()
+        if notify:
+            _notify("📊 行情提醒", f"{removed_name}（{code}）\n多次获取失败，已自动从盯盘列表移除")

@@ -12,7 +12,7 @@ Linux dependencies:
     sudo apt install xdotool libnotify-bin
 
 Windows dependencies:
-    pip install pyautogui win10toast
+    pip install pyautogui  (no extra deps needed for notifications)
 
 NOTE —— Linux xdotool type 需要目标窗口处于焦点状态，调用方应确保窗口已激活。
 NOTE —— Windows 下如果 send_notification 遇到权限问题，建议以管理员身份运行。
@@ -21,6 +21,7 @@ NOTE —— Windows 下如果 send_notification 遇到权限问题，建议以�
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import subprocess
 
@@ -84,11 +85,60 @@ def mouse_click(x: int, y: int) -> None:
 
 # ── Desktop Notification ────────────────────────────────────────────────────
 
+def _windows_toast(title: str, body: str, duration_ms: int) -> None:
+    """Show a Windows notification using PowerShell + WinRT toasts.
+
+    Falls back to ``System.Windows.Forms.NotifyIcon`` balloon tip on older
+    Windows versions where the WinRT API isn't available.
+    """
+    # Prefer native WinRT toasts (Win 10+) — they look modern and land in
+    # Action Centre.  Fall back to the classic balloon tip on older systems.
+    ps_script = f'''\
+$title = [System.Environment]::GetEnvironmentVariable('_OXHORSE_TITLE')
+$body  = [System.Environment]::GetEnvironmentVariable('_OXHORSE_BODY')
+$dur   = [int][System.Environment]::GetEnvironmentVariable('_OXHORSE_DUR')
+
+# -- native WinRT toast (Windows 10+) --
+try {{
+    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+    $tpl = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
+        [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+    $tpl.SelectSingleNode('//text[@id="1"]').InnerText = $title
+    $tpl.SelectSingleNode('//text[@id="2"]').InnerText = $body
+    $nfr = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
+        'Oxhorse Tools')
+    $nfr.Show([Windows.UI.Notifications.ToastNotification]::new($tpl))
+}} catch {{
+    # -- fallback: classic balloon tip --
+    [System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null
+    $ni = New-Object System.Windows.Forms.NotifyIcon
+    $ni.Icon = [System.Drawing.SystemIcons]::Information
+    $ni.BalloonTipTitle  = $title
+    $ni.BalloonTipText   = $body
+    $ni.Visible = $true
+    $ni.ShowBalloonTip($dur * 1000)
+    Start-Sleep -Milliseconds ([Math]::Max($dur * 1000 + 1000, 6000))
+    $ni.Dispose()
+}}
+'''
+    subprocess.Popen(
+        ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={
+            **os.environ,
+            '_OXHORSE_TITLE': title,
+            '_OXHORSE_BODY': body,
+            '_OXHORSE_DUR': str(int(duration_ms / 1000)),
+        },
+    )
+
+
 def send_notification(title: str, body: str, duration_ms: int = 5000) -> None:
     """Pop a desktop notification.
 
     **Linux**: ``notify-send`` via ``subprocess``.
-    **Windows**: ``win10toast.ToastNotifier.show_toast``.
+    **Windows**: PowerShell WinRT toast (or balloon-tip fallback).
 
     Parameters:
         title: Notification title.
@@ -108,15 +158,9 @@ def send_notification(title: str, body: str, duration_ms: int = 5000) -> None:
             _log.exception("notify-send failed")
     elif is_windows():
         try:
-            from win10toast import ToastNotifier
-            toaster = ToastNotifier()
-            toaster.show_toast(
-                title, body,
-                duration=int(duration_ms / 1000),
-                threaded=True,
-            )
+            _windows_toast(title, body, duration_ms)
         except Exception:
-            _log.exception("win10toast.show_toast failed")
+            _log.exception("_windows_toast failed")
     else:
         _log.info("[cross_platform] Notification: [%s] %s", title, body)
 
